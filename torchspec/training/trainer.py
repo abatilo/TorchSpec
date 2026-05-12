@@ -44,6 +44,7 @@ from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataF
 from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -99,6 +100,26 @@ class Trainer(abc.ABC):
     def _setup_device_mesh(self) -> None:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
+        self.cache_rank = rank
+
+        usp_mesh = None
+        if getattr(self.args, "attention_backend", None) == "usp":
+            usp_mesh = get_usp_device_mesh()
+
+        if usp_mesh is not None:
+            self.mesh = usp_mesh
+            self.dp_size = getattr(self.args, "dp_size", world_size)
+            self.dp_mesh = usp_mesh["draft_dp"]
+            self.grad_sync_mesh = get_usp_grad_sync_mesh()
+            if self.grad_sync_mesh is None:
+                raise RuntimeError("USP grad sync mesh has not been initialized")
+            self.dp_group = usp_mesh.get_group("draft_dp")
+            self.dp_rank = dist.get_rank(self.dp_group)
+            logger.info(
+                f"[Rank {rank}] Device mesh (USP): world_size={world_size}, dp_size={self.dp_size}, "
+                f"dp_rank={self.dp_rank}, grad_sync_size={world_size}"
+            )
+            return
 
         self.dp_size = world_size
         self.dp_rank = rank
@@ -106,6 +127,7 @@ class Trainer(abc.ABC):
         self.mesh = init_device_mesh("cuda", mesh_shape=(self.dp_size,), mesh_dim_names=("dp",))
         self.dp_group = self.mesh.get_group("dp")
         self.dp_mesh = self.mesh
+        self.grad_sync_mesh = self.dp_mesh
 
         logger.info(
             f"[Rank {rank}] Device mesh (1D): world_size={world_size}, dp_size={self.dp_size}"
@@ -156,10 +178,13 @@ class Trainer(abc.ABC):
     ) -> None:
         self.train_queue = queue
         self.per_dp_rank_batch_size = per_dp_rank_batch_size
+        usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
+        if usp_enabled and per_dp_rank_batch_size != 1:
+            raise ValueError("USP requires per_dp_rank_batch_size=1")
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         prefetch_depth = getattr(self.args, "prefetch_depth", 0)
         gpu_device = torch.cuda.current_device()
@@ -180,6 +205,9 @@ class Trainer(abc.ABC):
             last_turn_loss_only=self.last_turn_loss_only,
             skip_after_header=self.skip_after_header,
             min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
+            usp_enabled=usp_enabled,
+            ttt_length=getattr(self.args, "ttt_length", 1),
+            max_seq_length=getattr(self.args, "max_seq_length", None),
         )
 
         if prefetch_depth > 0:
@@ -209,10 +237,11 @@ class Trainer(abc.ABC):
         mooncake_config: Optional[MooncakeConfig] = None,
         per_dp_rank_batch_size: int = 1,
     ) -> None:
+        usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         self._eval_data_fetcher = MooncakeDataFetcher(
             queue=queue,
@@ -226,6 +255,9 @@ class Trainer(abc.ABC):
             last_turn_loss_only=self.last_turn_loss_only,
             skip_after_header=self.skip_after_header,
             min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
+            usp_enabled=usp_enabled,
+            ttt_length=getattr(self.args, "ttt_length", 1),
+            max_seq_length=getattr(self.args, "max_seq_length", None),
         )
         self._eval_collator = collator
         self._eval_cache: list[dict] = []
@@ -248,7 +280,7 @@ class Trainer(abc.ABC):
         self._wait_for_eval_cache_save()
 
         cache_snapshot = list(self._eval_cache)
-        rank = self.dp_rank
+        rank = self.cache_rank
 
         def _save() -> None:
             os.makedirs(cache_dir, exist_ok=True)
@@ -269,7 +301,7 @@ class Trainer(abc.ABC):
     def load_eval_cache(self, cache_dir: str) -> int:
         # Safe guard to wait for eval cache save to complete.
         self._wait_for_eval_cache_save()
-        path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
+        path = os.path.join(cache_dir, f"eval_rank_{self.cache_rank}.pt")
         if not os.path.exists(path):
             return 0
         try:

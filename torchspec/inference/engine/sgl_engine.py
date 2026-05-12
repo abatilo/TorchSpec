@@ -63,6 +63,35 @@ _PROTECTED_ENGINE_KEYS = frozenset(
 )
 
 
+_USP_SHARDED_MOONCAKE_ENV_KEYS = (
+    "TORCHSPEC_USP_SHARDED_MOONCAKE",
+    "TORCHSPEC_USP_SP_SIZE",
+    "TORCHSPEC_USP_RING_SIZE",
+    "TORCHSPEC_USP_TTT_LENGTH",
+    "TORCHSPEC_USP_MAX_SEQ_LENGTH",
+)
+
+
+def _configure_usp_sharded_mooncake_env(args: Any, max_seq_length: int | None) -> None:
+    values: dict[str, str] = {}
+    if getattr(args, "attention_backend", None) == "usp":
+        sp_ring_size = getattr(args, "sp_ring_size", 1)
+        values = {
+            "TORCHSPEC_USP_SHARDED_MOONCAKE": "1",
+            "TORCHSPEC_USP_SP_SIZE": str(getattr(args, "sp_ulysses_size", 1) * sp_ring_size),
+            "TORCHSPEC_USP_RING_SIZE": str(sp_ring_size),
+            "TORCHSPEC_USP_TTT_LENGTH": str(getattr(args, "ttt_length", 1)),
+        }
+        if max_seq_length is not None:
+            values["TORCHSPEC_USP_MAX_SEQ_LENGTH"] = str(max_seq_length)
+
+    for name in _USP_SHARDED_MOONCAKE_ENV_KEYS:
+        if name in values:
+            os.environ[name] = values[name]
+        else:
+            os.environ.pop(name, None)
+
+
 class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
     """Ray actor wrapper for sgl.Engine with distributed deployment support.
 
@@ -225,8 +254,10 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTED_ENGINE_KEYS}
             engine_kwargs.update(extra)
 
-        # Protected keys — always set by TorchSpec, never overridable
+        # SGLang's patched scheduler reads these process env vars when writing
+        # Mooncake training tensors.
         max_seq_length = getattr(self.args, "max_seq_length", None)
+        _configure_usp_sharded_mooncake_env(self.args, max_seq_length)
 
         engine_kwargs.update(
             {
@@ -465,6 +496,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                     "tensor_shapes": tensor_shapes,
                     "tensor_dtypes": self._get_tensor_dtypes(),
                 }
+                if getattr(self.args, "attention_backend", None) == "usp":
+                    output["metadata"] = {"usp_sharded": True}
                 outputs.append(output)
 
         logger.debug(

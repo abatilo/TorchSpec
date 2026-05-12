@@ -104,7 +104,7 @@ class Eagle3Trainer(Trainer):
         ]
         eagle3_model = apply_fsdp2(
             eagle3_model,
-            mesh=self.dp_mesh,
+            mesh=self.grad_sync_mesh,
             cpu_offload=self.fsdp_cpu_offload,
             args=self.args,
             modules_to_shard=midlayer_modules,
@@ -113,7 +113,7 @@ class Eagle3Trainer(Trainer):
         eagle3_model = fsdp2_load_full_state_dict(
             eagle3_model,
             full_state,
-            self.dp_mesh,
+            self.grad_sync_mesh,
             cpu_offload=True if self.fsdp_cpu_offload else None,
         )
 
@@ -288,14 +288,17 @@ class Eagle3Trainer(Trainer):
             )
         del target_hidden_states
 
-        plosses, _, acces = self.model(
+        plosses, vlosses, acces, acc_counts = self.model(
             input_ids=input_ids,
             attention_mask=batch["attention_mask"].cuda(),
             target=target,
             loss_mask=loss_mask,
             hidden_states=batch["hidden_states"].cuda(),
+            position_ids=batch.get("position_ids").cuda()
+            if batch.get("position_ids") is not None
+            else None,
         )
-        return plosses, acces
+        return plosses, vlosses, acces, acc_counts
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
         ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -310,10 +313,11 @@ class Eagle3Trainer(Trainer):
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position metrics."""
         with torch.no_grad():
-            plosses, acces = self._forward(batch)
+            _plosses, vlosses, acces, acc_counts = self._forward(batch)
         return {
-            "plosses": torch.stack(plosses).detach(),
+            "vlosses": torch.stack(vlosses).detach(),
             "acces": torch.stack(acces).detach(),
+            "acc_counts": torch.stack(acc_counts).detach(),
         }
 
     def eval_from_cache(self) -> dict:
@@ -347,11 +351,13 @@ class Eagle3Trainer(Trainer):
         if not all_step_metrics:
             return {}
 
-        avg_plosses = torch.stack([m["plosses"] for m in all_step_metrics]).mean(dim=0)
+        avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
         avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
 
-        dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+
+        avg_acc_scalar = avg_acces.mean().item()
 
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -360,22 +366,22 @@ class Eagle3Trainer(Trainer):
             simulated_acc_len += cumulative
 
         ploss_weights = torch.tensor(
-            [0.8**i for i in range(avg_plosses.shape[0])], device=avg_plosses.device
+            [0.8**i for i in range(avg_vlosses.shape[0])], device=avg_vlosses.device
         )
-        weighted_avg_loss = (avg_plosses * ploss_weights).sum().item() / ploss_weights.sum().item()
+        weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
 
         metrics: dict = {
             "eval/avg_loss": weighted_avg_loss,
-            "eval/avg_acc": avg_acces.mean().item(),
+            "eval/avg_acc": avg_acc_scalar,
             "eval/simulated_acc_len": simulated_acc_len,
         }
-        for i in range(avg_plosses.shape[0]):
-            metrics[f"eval/ploss_{i}"] = avg_plosses[i].item()
+        for i in range(avg_vlosses.shape[0]):
+            metrics[f"eval/ploss_{i}"] = avg_vlosses[i].item()
             metrics[f"eval/acc_{i}"] = avg_acces[i].item()
 
         if dist.get_rank() == 0:
             logger.info(
-                f"eval: loss={weighted_avg_loss:.4f}, acc={avg_acces.mean().item():.4f}, "
+                f"eval: loss={weighted_avg_loss:.4f}, acc={avg_acc_scalar:.4f}, "
                 f"sim_acc_len={simulated_acc_len:.2f}"
             )
 
@@ -393,12 +399,14 @@ class Eagle3Trainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
-        plosses, acces = self._forward(batch)
+        plosses, vlosses, acces, acc_counts = self._forward(batch)
         total_loss = self._backward(plosses, accumulation_steps=accumulation_steps)
 
         return {
             "plosses": torch.stack(plosses).detach(),
+            "vlosses": torch.stack(vlosses).detach(),
             "acces": torch.stack(acces).detach(),
+            "acc_counts": torch.stack(acc_counts).detach(),
             "plosses_raw": [p.detach() for p in plosses],
             "acces_raw": [a.detach() for a in acces],
             "total_loss": total_loss.detach(),
@@ -432,14 +440,13 @@ class Eagle3Trainer(Trainer):
         if not all_step_metrics:
             return {}
 
-        plosses = [m["plosses"] for m in all_step_metrics]
-        acces = [m["acces"] for m in all_step_metrics]
+        avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
+        avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
 
-        avg_plosses = torch.stack(plosses).mean(dim=0)
-        avg_acces = torch.stack(acces).mean(dim=0)
-
-        dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+
+        avg_acc_scalar = avg_acces.mean().item()
 
         # Simulated acceptance length: acc_0 + acc_0*acc_1 + acc_0*acc_1*acc_2 + ...
         # Models the expected number of consecutively accepted draft tokens,
@@ -452,13 +459,13 @@ class Eagle3Trainer(Trainer):
 
         # Compute weighted loss matching _backward's 0.8^i weighting
         ploss_weights = torch.tensor(
-            [0.8**i for i in range(avg_plosses.shape[0])], device=avg_plosses.device
+            [0.8**i for i in range(avg_vlosses.shape[0])], device=avg_vlosses.device
         )
-        weighted_avg_loss = (avg_plosses * ploss_weights).sum().item() / ploss_weights.sum().item()
+        weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
 
         metrics = {
             "train/avg_loss": weighted_avg_loss,
-            "train/avg_acc": avg_acces.mean().item(),
+            "train/avg_acc": avg_acc_scalar,
             "train/simulated_acc_len": simulated_acc_len,
             "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
             "train/global_step": self.global_step,
@@ -466,8 +473,8 @@ class Eagle3Trainer(Trainer):
             "train/step": step,
         }
 
-        for i in range(avg_plosses.shape[0]):
-            metrics[f"train/ploss_{i}"] = avg_plosses[i].item()
+        for i in range(avg_vlosses.shape[0]):
+            metrics[f"train/ploss_{i}"] = avg_vlosses[i].item()
             metrics[f"train/acc_{i}"] = avg_acces[i].item()
 
         if dist.get_rank() == 0:

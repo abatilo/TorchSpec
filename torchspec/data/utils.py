@@ -47,8 +47,9 @@ def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
 
 
 class DataCollatorWithPadding:
-    def __init__(self):
+    def __init__(self, usp_enabled: bool = False):
         self.sp_degree = 1
+        self.usp_enabled = usp_enabled
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
@@ -87,14 +88,16 @@ class DataCollatorWithPadding:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["input_ids"].shape[1] for item in features)
         max_length = ((max_length + self.sp_degree - 1) // self.sp_degree) * self.sp_degree
-        # Round up to nearest bucket to reduce unique shapes for torch.compile.
-        # Without this, every batch gets a different padded length, causing
-        # FlexAttention recompilation (~1s overhead per new shape).
-        _BUCKET = 256
-        max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
 
-        # All real tokens get attention_mask=1; paddingtensor2D zero-pads the rest.
-        attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
+        if self.usp_enabled:
+            attention_masks = [item["attention_mask"].long() for item in features]
+        else:
+            # Round up to nearest bucket to reduce unique shapes for torch.compile.
+            # Without this, every batch gets a different padded length, causing
+            # FlexAttention recompilation (~1s overhead per new shape).
+            _BUCKET = 256
+            max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
+            attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
 
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]
@@ -113,6 +116,14 @@ class DataCollatorWithPadding:
             "target": None,
             "last_hidden_states": None,
         }
+        if self.usp_enabled:
+            max_position_length = max(item["position_ids"].shape[1] for item in features)
+            batch["position_ids"] = torch.cat(
+                [
+                    self.paddingtensor2D(item["position_ids"], max_position_length)
+                    for item in features
+                ]
+            )
         if all("hidden_states" in item for item in features):
             batch["hidden_states"] = torch.cat(
                 [self.paddingtensor(item["hidden_states"], max_length) for item in features]
@@ -225,6 +236,15 @@ def resolve_loss_mask(
     packed = data.get("packed_loss_mask")
     if packed is not None:
         mask = unpack_loss_mask(packed)
+        input_ids = data.get("input_ids")
+        if input_ids is not None:
+            if input_ids.dim() == 2:
+                input_ids = input_ids.squeeze(0)
+            expected_len = input_ids.shape[-1]
+            if mask.shape[0] > expected_len:
+                mask = mask[:expected_len]
+            elif mask.shape[0] < expected_len:
+                mask = torch.nn.functional.pad(mask, (0, expected_len - mask.shape[0]))
         if not mask.any():
             return None
         data["loss_mask"] = mask
