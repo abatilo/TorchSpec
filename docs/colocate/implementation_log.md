@@ -23,10 +23,10 @@
 | 2 | Union NCCL world (no transfer yet) | 🟡 | Yes (8×H100) | helper + 8-rank smoke test pass; trainer/engine wire-up + sglang patch deferred to Phase 4 |
 | 3 | NCCL P2P data plane (dummy tensors) | ✅ | Yes (2×H100) | 3/3 P2P dummy tests pass on Modal in 137 s; scaled down from plan's 4-GPU MPS topology — see deviations |
 | 4 | Real hidden-state hook in sglang | 🟢 | Yes (2×H100) | TorchSpec-side library + wiring complete; multi-tensor round-trip Modal test green; full one-step blocked on upstream sglang patch (surface documented in [`sglang_patch.md`](sglang_patch.md)) |
-| 5 | Controller trim & loop integration | ⬜ | Yes (4×H100) | |
-| 6 | Memory caps, MPS hygiene, stability | ⬜ | Yes (4×H100) | slow 1000-step |
-| 7 | Numeric parity & convergence | ⬜ | Yes (4–8×H100) | needs disagg control run |
-| 8 | Docs & examples | ⬜ | No | |
+| 5 | Controller trim & loop integration | 🟢 | Yes (4×H100) | Mooncake-free `setup_colocate_training_with_engines` + `train_entry` branch landed; Phase-5 unit tests (`test_phase5_no_mooncake.py`) green; sync loop body raises `NotImplementedError` until upstream sglang patch lands |
+| 6 | Memory caps, MPS hygiene, stability | 🟢 | Yes (4×H100) | init-order fence + peak-alloc profiler metric + MPS daemon `atexit` cleanup landed; `test_stability.py` skeleton skipped pending upstream sglang patch |
+| 7 | Numeric parity & convergence | 🟢 | Yes (4–8×H100) | `test_grad_parity.py` + `test_convergence.py` skeletons landed (skipped pending upstream sglang patch) |
+| 8 | Docs & examples | ✅ | No | `docs/colocate/usage.md`, `configs/colocate_qwen3_8b.yaml`, `examples/colocate-qwen3-8b-1node/`, and the colocate row in `docs/ray.md` all landed |
 
 Legend: ⬜ pending, 🟡 in progress, ✅ done, ⏭ skipped/deferred.
 
@@ -568,7 +568,7 @@ Two layers:
 
 ## Phase 5 — Controller trim & loop integration
 
-Status: ⬜
+Status: 🟢 (Mooncake-free wiring complete; sync-loop body parked behind upstream sglang patch)
 
 ### Plan recap
 
@@ -576,20 +576,71 @@ See [`implementation.md` §Phase 5](implementation.md#phase-5--controller-trim--
 
 ### Work log
 
-_(populated as work progresses)_
+- **`ColocateTrainSample` + `ColocateDataset` + `ColocateDataFetcher`**
+  (`torchspec/training/data_fetcher.py`) — already landed in Phase 4
+  for the data plane; in this phase we promote them to first-class
+  citizens by wiring `Trainer.set_train_queue` and
+  `Trainer.set_eval_queue` to construct the colocate variants whenever
+  `transfer_mode=='nccl'`. Mooncake config is no longer threaded
+  through.
+- **`setup_colocate_training_with_engines`** (`torchspec/controller/setup.py`,
+  exported from `torchspec/controller/__init__.py`) — colocate sibling
+  of `setup_async_training_with_engines`. Differences:
+  - No `AsyncInferenceManager` (returns `(controller, None)`).
+  - Calls `train_group.set_train_queues(..., mooncake_config=None)`
+    and `set_eval_queues(..., mooncake_config=None)`.
+  - Avoids importing any `torchspec.transfer.mooncake.*` module from
+    the colocate code path.
+- **`train_entry.py` branch** — when `is_mps_colocate(args)`:
+  - Skips `launch_mooncake_master` and `build_mooncake_config`.
+  - Adds an init-order fence: `ray.get(train_init_refs)` runs before
+    `prepare_inference_engines` so the trainer is the first to call
+    `torch.cuda.set_per_process_memory_fraction(train_frac)` on each
+    shared GPU. This is also Phase 6's "trainer init order" sub-task.
+  - Calls `setup_colocate_training_with_engines` instead of
+    `setup_async_training_with_engines`.
+  - Raises `NotImplementedError("colocate sync loop pending upstream
+    sglang patch")` immediately after setup. The synchronous loop
+    body itself is the one piece that's gated on the upstream sglang
+    patch (without it, the engine has no NCCL hidden-state callback
+    and the loop would hang on the first `recv`).
 
 ### Verification
 
-Modal target: extends `phase4_one_step`.
+- `tests/colocate/test_phase5_no_mooncake.py` — three unit tests:
+  1. `test_colocate_setup_module_does_not_import_mooncake_runtime`
+     loads `torchspec.controller.setup` in a fresh interpreter and
+     asserts none of `torchspec.transfer.mooncake.*` are in
+     `sys.modules`.
+  2. `test_colocate_setup_function_signature_matches_async` keeps the
+     two setup functions interface-compatible so future cleanup can
+     dedupe them safely.
+  3. `test_colocate_setup_returns_none_inference_manager` ensures the
+     colocate variant skips the `AsyncInferenceManager`.
+- Modal end-to-end (`phase4_one_step`) is gated on the upstream
+  sglang patch — see Phase 4. The Mooncake-master-not-running and
+  fast-first-step gates from the plan are observable from the
+  `train_entry` log lines and `pgrep mooncake_master` once the patch
+  lands and a colocate run is allowed past the `NotImplementedError`.
 
-- `pgrep mooncake_master` returns nothing post-run.
-- First training step starts within ~seconds of init (no async ramp-up).
+### Deviations from plan
+
+- Plan §Phase 5 sub-task 4 ("synchronous step loop variant" in
+  `controller/loop.py`) is not yet a runnable code path — it raises
+  `NotImplementedError` because every alternative we tried hangs
+  without the upstream sglang patch (the engine has nowhere to send
+  hidden states to). Once the patch lands, the loop body is a
+  ~30-line drop-in: replace
+  `controller.try_dispatch_batch + sample_pool.pop` with
+  `controller.broadcast_meta(step) + engine.generate_one_step() +
+  trainer.train_one_step()`. The wiring around it (placement, union
+  world, fetcher swap, no-Mooncake setup) is all in place.
 
 ---
 
 ## Phase 6 — Memory caps, MPS hygiene, stability
 
-Status: ⬜
+Status: 🟢 (TorchSpec-side hooks complete; 1k-step empirical run blocked on upstream sglang patch)
 
 ### Plan recap
 
@@ -597,20 +648,65 @@ See [`implementation.md` §Phase 6](implementation.md#phase-6--memory-caps-mps-h
 
 ### Work log
 
-_(populated as work progresses)_
+- **Trainer init-order fence** — `train_entry.py` `[9] Setup training`
+  block runs `ray.get(train_init_refs)` *before* invoking
+  `prepare_inference_engines(...)` whenever `is_mps_colocate(args)`.
+  This guarantees `torch.cuda.set_per_process_memory_fraction(train_frac)`
+  is applied on every GPU before sglang's KV-cache pre-allocator runs;
+  with both processes sharing the same allocator pool under MPS, the
+  pre-allocator otherwise burns into the trainer's budget.
+- **`expandable_segments` propagation** — verified end-to-end. Phase 1
+  injects it into `RayTrainGroup` and `_prepare_sgl_engines`
+  `runtime_env`s; Phase 8's `examples/colocate-qwen3-8b-1node/run.sh`
+  also exports it on the driver side so the driver-side Ray client
+  inherits it.
+- **MPS daemon `atexit` cleanup** — `torchspec/colocate/mps.py`'s
+  `setup_for_colocate(register_atexit=True)` (default) registers a
+  `quit`-the-daemon hook iff *this* process started the daemon (the
+  helper tracks ownership). Idempotent; the daemon is left alone if
+  it was already running. Crash paths still leak it (atexit doesn't
+  fire on SIGKILL); user-visible workaround documented in
+  [`docs/colocate/usage.md`](usage.md).
+- **`peak_alloc_metrics` on `TrainProfiler`**
+  (`torchspec/utils/profiling.py`) — returns
+  `{peak_bytes_allocated, current_bytes_allocated,
+  peak_bytes_reserved, current_bytes_reserved}` and optionally calls
+  `torch.cuda.reset_peak_memory_stats()` for clean per-step deltas.
+  `Trainer._train_core_from_queue` invokes it with `reset=True` after
+  each step and emits the values into the profiler dump
+  (`perf/peak_bytes_allocated` etc.).
+- **`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`** — kept off by default per
+  the plan; an opt-in env knob is documented in
+  [`docs/colocate/usage.md`](usage.md). No code path consumes it
+  inside TorchSpec.
 
 ### Verification
 
-Modal target: `phase6_stability` (slow, `--detach` recommended).
+- `tests/colocate/test_stability.py` — skeleton with two skipped
+  tests (`test_phase6_peak_alloc_flatness_over_1000_steps`,
+  `test_phase6_no_oom_under_load`). Both `pytest.skip` until the
+  upstream sglang patch unblocks `phase6_stability`. The skeleton
+  pins the `peak_alloc(step=10) ≈ peak_alloc(step=999) within 1%`
+  acceptance criterion in code so the bar can't drift.
+- Modal target: `phase6_stability` (`--detach`-friendly,
+  ~hour-scale). Wired in `scripts/modal/modal_colocate_smoke.py`
+  but disabled until the patch lands.
 
-- `peak_alloc(step=10)` ≈ `peak_alloc(step=999)` within 1 %.
-- No process-side OOM, no system-side hang.
+### Deviations from plan
+
+- The plan has the trainer "warm its allocator (one dummy fwd/bwd)
+  before sglang starts". We landed the cheaper version: the
+  init-order fence ensures `set_per_process_memory_fraction` is
+  applied first; the dummy fwd/bwd is only needed if we observe
+  fragmentation under the 1k-step Modal run. Logged as a follow-up
+  if `test_phase6_peak_alloc_flatness_over_1000_steps` fails when
+  it can finally run.
 
 ---
 
 ## Phase 7 — Numeric parity & convergence
 
-Status: ⬜
+Status: 🟢 (test skeletons + acceptance criteria locked in code; empirical runs blocked on upstream sglang patch)
 
 ### Plan recap
 
@@ -618,20 +714,42 @@ See [`implementation.md` §Phase 7](implementation.md#phase-7--numeric-parity--c
 
 ### Work log
 
-_(populated as work progresses)_
+- **`tests/colocate/test_grad_parity.py`** —
+  `test_phase7_grad_parity_per_parameter` skeleton, marked
+  `pytest.skip` with a clear message pointing at
+  [`sglang_patch.md`](sglang_patch.md). The acceptance criterion
+  (`torch.allclose(g_disagg, g_colocate, atol=1e-6, rtol=0)` per
+  parameter) is encoded as a docstring/TODO so the bar doesn't
+  drift between branches.
+- **`tests/colocate/test_convergence.py`** —
+  `test_phase7_convergence_curves_match_within_2pct` and
+  `test_phase7_eval_loss_matches`, both marked
+  `pytest.skip` + `pytest.mark.slow`. Acceptance is the same as
+  the plan: per-step loss within 1–2 %, eval loss within
+  tokenizer-deterministic noise.
+- Both files hold dependencies on a "disagg control run" snapshot
+  that we don't generate yet — when the upstream patch lands the
+  skeleton needs (a) a recorded disagg gradient/loss baseline on
+  the same prompts/seed, and (b) a colocate run to compare. The
+  Modal entrypoints (`phase7_grad_parity`, `phase7_convergence`)
+  are placeholders.
 
 ### Verification
 
 Two Modal targets:
 
-- `phase7_grad_parity` — single-step gradient match against disagg.
-- `phase7_convergence` — 1k-step loss-curve overlap (slow).
+- `phase7_grad_parity` — single-step gradient match against disagg
+  (parked).
+- `phase7_convergence` — 1k-step loss-curve overlap, slow (parked).
+
+Both will move out of skip-state once the upstream sglang patch
+unblocks the colocate sync loop.
 
 ---
 
 ## Phase 8 — Documentation & examples
 
-Status: ⬜
+Status: ✅
 
 ### Plan recap
 
@@ -639,7 +757,53 @@ See [`implementation.md` §Phase 8](implementation.md#phase-8--documentation--ex
 
 ### Work log
 
-_(populated as work progresses)_
+- **`docs/ray.md`** — added a colocate row to the placement-group
+  table that calls out the new `colocate_strategy=mps` +
+  `transfer_mode=nccl` mode, the fractional `num_gpus_per_actor`
+  semantics, and links to the new usage doc.
+- **`docs/colocate/usage.md` (new)** — user-facing guide. Covers:
+  when to use colocate vs disaggregated; hardware/software prereqs;
+  the GPU-layout invariants (1:1 trainer↔engine pairing,
+  `tp_size==1`); the memory-split formula
+  (`train_frac + infer_frac + 0.10 ≤ 1.0`); a quickstart pointing
+  at `examples/colocate-qwen3-8b-1node/`; the four config fields +
+  the three Phase-0 validation rules; what changes inside a run
+  (placement, MPS daemon, distributed init, fetcher, engine init,
+  controller); the validation matrix mapping each phase's Modal
+  smoke entrypoint to "what it proves"; known limitations
+  (single-node, sglang-only, sync-only, upstream patch dependency,
+  USP unsupported); a small troubleshooting section (hangs, OOM,
+  daemon-not-running, `via PCIe`, daemon zombies); and a "where the
+  code lives" map back to the source files.
+- **`configs/colocate_qwen3_8b.yaml` (new)** — colocate sibling of
+  `configs/sglang_qwen3_8b.yaml`. Differs only in the four colocate
+  fields, the GPU layout (`training_num_gpus_per_node=4`,
+  `inference_num_gpus=4`, `inference_num_gpus_per_engine=1`,
+  `tp_size=1`), and the output paths. Kept structurally identical so
+  side-by-side diff for Phase-7 parity runs is meaningful.
+- **`examples/colocate-qwen3-8b-1node/` (new)** — the colocate
+  sibling of `examples/qwen3-8b-single-node/`:
+  - `run.sh` exports
+    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, defaults
+    `CUDA_VISIBLE_DEVICES=0,1,2,3`, pins `tp_size=1` /
+    `inference_num_gpus_per_engine=1`, and forwards extra args to
+    `python -m torchspec.train_entry`. Diff against the
+    disaggregated run script is small and deliberate.
+  - `README.md` — short user-facing overview that links into
+    `docs/colocate/usage.md` for the full background; calls out the
+    upstream-patch dependency and the expected hang signature.
+
+### Verification
+
+Pure docs + example. No Modal time required.
+
+- `python -m torchspec.train_entry --config configs/colocate_qwen3_8b.yaml`
+  on a non-colocate-patched sglang reaches setup and raises the
+  Phase-5 `NotImplementedError("colocate sync loop pending upstream
+  sglang patch")` — that's the documented dry-run signature.
+- All existing examples still parse with their existing configs
+  (Phase-0 validation only fires the new errors when the new
+  fields are set).
 
 ---
 
