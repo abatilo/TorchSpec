@@ -387,6 +387,45 @@ def phase4_one_step():
 
 
 # =============================================================================
+# Tiny (1×GPU + Qwen3-0.6B) — cheap-host smoke; verifies skip behaviour on Modal
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu="H100:1", **_common_kwargs)
+def _run_phase_tiny():
+    """Run the 1-GPU tiny-model colocate smoke (Phase-4 one-step + Phase-7
+    mini convergence) inside the Modal image.
+
+    On Modal sandbox the host doesn't pass --ipc=host so MPS fails with
+    'operation not supported'; the test correctly skips. Running it here
+    proves:
+      * the tiny config is accepted by Phase-0 validation;
+      * the tiny test file imports cleanly inside the image;
+      * the MPS-probe skip gate matches the 4-GPU tests' behaviour.
+
+    Once the same image runs on a host that exposes --ipc=host (Vast.ai,
+    Lambda Labs, etc.), this entry point is the easiest way to drive the
+    same code path that scripts/colocate/run_smoke_host.sh runs locally.
+    """
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_colocate_tiny.py")
+    if rc != 0:
+        raise RuntimeError(f"phase_tiny failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase_tiny():
+    """Single-GPU colocate smoke (Qwen3-0.6B, 1×H100).
+
+    Mirrors scripts/colocate/run_smoke_host.sh on Modal so we can
+    sanity-check the test importability + skip-gate behaviour without
+    paying for a 4-GPU job. Will SKIP on Modal sandbox (no MPS); will
+    PASS on any host with --ipc=host."""
+    _run_phase_tiny.remote()
+
+
+# =============================================================================
 # Phase 6 — 1000-step stability (slow)
 # =============================================================================
 

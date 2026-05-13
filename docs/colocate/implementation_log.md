@@ -936,26 +936,95 @@ Phase 1 placement test also got the MPS-fallback fixture treatment
 (`3836024`) so the args-validation test still runs on hosts where
 the MPS fixture has to skip.
 
-**Phase verification matrix on Modal sandbox (final):**
+**Phase verification matrix on Modal sandbox (final, 2026-05-13 re-verified):**
 
-| Phase | Modal entrypoint | Status | Notes |
-|-------|------------------|--------|-------|
-| 1 — placement | `phase1_placement` | 1 passed, 4 skipped | args validation passes; MPS fixtures skip cleanly. |
-| 2 — union world | `phase2_union_world` | 1/1 PASSED | 8×H100, no MPS dependency. |
-| 3 — P2P dummy | `phase3_p2p_dummy` | parked from earlier session | 2-rank no-MPS path. |
-| 4 — multi-tensor | `phase4_multi_tensor` | 2/2 PASSED | 2-rank no-MPS path; confirms `init_process_group` `device_id=` removal doesn't regress lazy NCCL. |
-| 4 — one-step | `phase4_one_step` | SKIPPED (Modal sandbox lacks MPS) | will pass on a real DGX-style host with `--ipc=host`. |
-| 6 — stability | `phase6_stability` | SKIPPED (Modal sandbox lacks MPS) | same. |
-| 7 — grad parity | `phase7_grad_parity` | SKIPPED (Modal sandbox lacks MPS) | same. |
-| 7 — convergence | `phase7_convergence` | SKIPPED (Modal sandbox lacks MPS) | same. |
+| Phase | Modal entrypoint | GPUs | Wall-clock | Status |
+|-------|------------------|------|------------|--------|
+| probe — patch surface | `probe` | H100:1 | 35 s | 4/4 patch-surface assertions pass |
+| 1 — placement | `phase1_placement` | H100:4 | 40 s | 1 passed, 4 skipped (MPS fixtures skip cleanly) |
+| 2 — union world | `phase2_union_world` | H100:8 | 180 s (prior run) | 1/1 PASSED (no MPS dependency) |
+| 3 — P2P dummy | `phase3_p2p_dummy` | H100:2 | 138 s (prior run) | 3/3 PASSED (no MPS dependency) |
+| 4 — multi-tensor | `phase4_multi_tensor` | H100:2 | 69 s | 2/2 PASSED (no MPS dependency) |
+| 4 — one-step | `phase4_one_step` | H100:4 | 33 s | 1 SKIPPED (Modal sandbox lacks MPS) |
+| 6 — stability | `phase6_stability` | H100:4 | — | 2 SKIPPED (Modal sandbox lacks MPS) |
+| 7 — grad parity | `phase7_grad_parity` | H100:4 | — | 1 SKIPPED (Modal sandbox lacks MPS) |
+| 7 — convergence | `phase7_convergence` | H100:4 | — | 2 SKIPPED (Modal sandbox lacks MPS) |
+| tiny — 1-GPU smoke | `phase_tiny` | H100:1 | 80 s | 2 SKIPPED (Modal sandbox lacks MPS) |
 
 The Phase-4-through-Phase-7 tests are *implemented* (commits
 `f4e8817`, `33d71fa`, `4c1e042`, `9824bf8`, `58be9c7`, `b923736`,
 `975d1a6`) and are gated to run when MPS is functional. To exercise
-them, point `modal run --env <env>` at a function whose container
-image has been built with `--ipc=host` (or run them on a bare-metal
-4×H100 + MPS host). The fallback path (no MPS, fractional GPU
-sharing only) is a graceful degradation that lets `train_entry`
-reach the colocate loop without crashing — but inter-process NCCL
-P2P still needs real MPS, which is why we skip rather than
-"functionally run with degraded performance".
+them, run on a host that exposes `--ipc=host` to its container
+runtime (Modal sandbox doesn't — Modal uses gVisor by default and
+gVisor's nvproxy [explicitly](https://github.com/google/gvisor/blob/master/g3doc/proposals/nvidia_driver_proxy.md)
+does not implement MPS multiplexing). The fallback path (no MPS,
+fractional GPU sharing only) is a graceful degradation that lets
+`train_entry` reach the colocate loop without crashing — but
+inter-process NCCL P2P still needs real MPS, which is why we
+skip rather than "functionally run with degraded performance".
+
+---
+
+## Cheap-host workflow for MPS-required validation
+
+When the Modal-sandbox MPS limitation was diagnosed, we needed a
+cost-effective way to actually *run* the Phase-4 / 6 / 7 tests on a
+non-Modal host without spending hundreds of dollars on a 4×H100
+spot instance. The bottleneck was the Qwen3-8B + 4-rank topology
+the original tests were built around — the test pre-conditions
+(`has_h100_quad()`) hard-required 4 GPUs even though the *code path*
+they exercise (MPS daemon, 1:1 trainer↔engine pairing, NCCL
+P2P union world, sglang colocate.patch hidden-state hook) is fully
+exercised by a 1×GPU + 1-trainer + 1-engine + tiny-model topology.
+
+**Solution: `tests/colocate/test_colocate_tiny.py` + `configs/colocate_qwen0p6b_tiny.yaml` + `scripts/colocate/run_smoke_host.sh`.**
+
+The tiny variant runs on a single 24 GB consumer- or L40S-class GPU
+with Qwen3-0.6B-Base, exercises the full colocate sync loop, and
+gates on `has_n_gpus(1) AND mps_works()` instead of `has_h100_quad()`.
+On a 4×H100 host both test sets run; on a 1×L40S host only the tiny
+variant runs (the 4-GPU tests skip with a clear reason); on Modal
+sandbox both skip (clean SKIP, no hangs).
+
+| Cost target | Host | Hourly | One pass | What it verifies |
+|---|---|---|---|---|
+| <$0.50 (recommended) | 1×L40S 48 GB on Vast.ai / Hyperstack | ~$0.50/hr | ~25 min | tiny one-step + tiny convergence (Phase 4 + 7) |
+| <$1 | 1×A6000 48 GB / 1×4090 24 GB on Vast.ai | ~$0.40/hr | ~25 min | tiny one-step + tiny convergence (Phase 4 + 7) |
+| <$2 | 1×H100 80 GB on Vast.ai / Lambda | ~$2.00/hr | ~25 min | tiny variant + leftover headroom for Qwen3-8B 1-rank smoke |
+| ~$5 | 4×H100 on Hyperstack / Lambda spot | ~$8/hr | ~30 min | full Phase-4 one-step + Phase-7 grad parity (Qwen3-8B) |
+
+**Run the tiny smoke on any cheap host:**
+
+```bash
+# After SSH-ing into the host (Vast.ai, Lambda, Hyperstack, ...):
+git clone https://github.com/zhubohao911/TorchSpec.git
+cd TorchSpec
+git checkout feature/colocate-training-inference
+bash scripts/colocate/run_smoke_host.sh        # full setup + run
+```
+
+The script: clones sglang at the pinned commit, applies both the
+existing disagg patch and the new colocate patch, `pip install -e .`s
+torchspec + sglang, runs `nvidia-smi` + MPS pre-flight, and finally
+`pytest -xvs tests/colocate/test_colocate_tiny.py`. Total time:
+~15 min image+deps + ~10 min model download + ~3 min test. Use
+`--skip-setup` on subsequent runs to skip the bootstrap.
+
+The same image still runs on Modal as a sanity check
+(`modal run --env sandbox scripts/modal/modal_colocate_smoke.py::phase_tiny`)
+where it cleanly SKIPs in <1 s thanks to `mps_works()` returning
+False. That's the contract: the tiny tests verify *correctness* on
+a cheap host that does support MPS, while still being a no-op
+liability on hosts (like Modal sandbox) that don't.
+
+**Note on the unit-test side:**
+`test_phase1_mps_helper.py::test_setup_for_colocate_returns_handle_and_env`
+and `::test_start_mps_daemon_runs_subprocess` were also updated to
+match the post-MPS-fallback semantics: the former passes
+`probe_server=False` (since the unit-test environment has no real
+CUDA driver to probe), and the latter creates the control pipe file
+in its `_fake_run` callback to satisfy the new pipe-poll loop in
+`start_mps_daemon`. A new
+`test_setup_for_colocate_falls_back_when_probe_fails` pins down the
+graceful-degradation behaviour we depend on for the Modal-sandbox
+SKIPs to work.

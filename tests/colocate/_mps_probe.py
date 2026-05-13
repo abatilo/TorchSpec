@@ -15,8 +15,8 @@ import shutil
 import subprocess
 
 
-def has_h100_quad() -> bool:
-    """Detect whether we're on a Modal H100:4 (or any 4+ GPU box)."""
+def has_n_gpus(n: int) -> bool:
+    """Return True iff at least ``n`` CUDA GPUs are visible to nvidia-smi."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -25,7 +25,17 @@ def has_h100_quad() -> bool:
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
-    return len([g for g in out.splitlines() if g.strip()]) >= 4
+    return len([g for g in out.splitlines() if g.strip()]) >= n
+
+
+def has_h100_quad() -> bool:
+    """Detect whether we're on a Modal H100:4 (or any 4+ GPU box).
+
+    Thin wrapper over ``has_n_gpus(4)`` for backwards compat with
+    existing Phase-4/6/7 ``pytest.mark.skipif`` calls; the cheap-host
+    1-GPU tiny tests use ``has_n_gpus(1)`` directly.
+    """
+    return has_n_gpus(4)
 
 
 def mps_works() -> bool:

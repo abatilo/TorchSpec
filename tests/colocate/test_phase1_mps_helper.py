@@ -13,6 +13,7 @@ runs on Modal as part of `phase1_placement` — see
 
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
@@ -135,6 +136,15 @@ def test_start_mps_daemon_runs_subprocess(tmp_path, monkeypatch):
     def _fake_run(args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs.get("env", {})
+        # Simulate the real daemon's behaviour: it creates the control
+        # pipe under pipe_dir before returning. start_mps_daemon polls
+        # for this file post-spawn (see mps.py), so the unit test must
+        # produce it or block on the 10-second deadline.
+        pipe_dir_str = kwargs.get("env", {}).get("CUDA_MPS_PIPE_DIRECTORY", "")
+        if pipe_dir_str:
+            os.makedirs(pipe_dir_str, exist_ok=True)
+            with open(os.path.join(pipe_dir_str, "control"), "w") as f:
+                f.write("")
         return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(mps_mod.subprocess, "run", _fake_run)
@@ -247,10 +257,37 @@ def test_setup_for_colocate_returns_handle_and_env(tmp_path, monkeypatch):
     monkeypatch.setattr(mps_mod, "is_mps_available", lambda: True)
     monkeypatch.setattr(mps_mod, "is_mps_running", lambda pipe_dir=None: True)
 
+    # The MPS-server probe spawns a CUDA subprocess (cuInit + cuDeviceGetCount)
+    # to detect hosts where the daemon comes up but the per-GPU server can't
+    # actually create a CUDA context. That's runtime/integration behaviour,
+    # not unit-test territory; this Mac dev box has no CUDA, so the probe
+    # would fail and (correctly) cause setup_for_colocate to return
+    # ``(None, {})``. Disable the probe so we exercise just the
+    # daemon-bring-up + env-var construction logic this test cares about.
+    handle, env = mps_mod.setup_for_colocate(
+        pipe_dir=str(tmp_path / "pipe"),
+        log_dir=str(tmp_path / "log"),
+        probe_server=False,
+    )
+    assert handle is not None
+    assert handle.pipe_dir == str(tmp_path / "pipe")
+    assert env["CUDA_MPS_PIPE_DIRECTORY"] == str(tmp_path / "pipe")
+    assert env["CUDA_MPS_LOG_DIRECTORY"] == str(tmp_path / "log")
+
+
+def test_setup_for_colocate_falls_back_when_probe_fails(tmp_path, monkeypatch):
+    """When the MPS server probe reports failure (Modal sandbox / no
+    --ipc=host), setup returns ``(None, {})`` instead of raising."""
+    monkeypatch.setattr(mps_mod, "is_mps_available", lambda: True)
+    monkeypatch.setattr(mps_mod, "is_mps_running", lambda pipe_dir=None: True)
+    monkeypatch.setattr(
+        mps_mod, "_probe_mps_server_works",
+        lambda pipe_dir, log_dir, **kw: (False, "operation not supported"),
+    )
+
     handle, env = mps_mod.setup_for_colocate(
         pipe_dir=str(tmp_path / "pipe"),
         log_dir=str(tmp_path / "log"),
     )
-    assert handle.pipe_dir == str(tmp_path / "pipe")
-    assert env["CUDA_MPS_PIPE_DIRECTORY"] == str(tmp_path / "pipe")
-    assert env["CUDA_MPS_LOG_DIRECTORY"] == str(tmp_path / "log")
+    assert handle is None
+    assert env == {}
