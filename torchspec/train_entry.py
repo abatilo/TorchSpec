@@ -299,11 +299,45 @@ def train_async_no_generation(args):
     init_tracking(args)
     timer = _InitTimer()
 
+    # [0] Pre-Ray MPS bring-up (Phase 1): once the MPS control daemon is
+    # running on a node, the *node* enters MPS client mode — every CUDA
+    # context on that node has to register with MPS by setting
+    # CUDA_MPS_PIPE_DIRECTORY (otherwise CUDA calls fail with
+    # error 805, "MPS client failed to connect"). Ray spawns its
+    # gcs/worker processes inheriting `os.environ`; if we start MPS
+    # *after* Ray is up, those workers come up with no MPS env and
+    # any later `torch.cuda.*` call in any actor blows up. Start
+    # the daemon first AND export the client env into our own
+    # process so every actor (including ones whose runtime_env we
+    # don't directly own, e.g. AsyncTrainingController) inherits it.
+    if is_mps_colocate(args):
+        from torchspec.colocate.mps import setup_for_colocate as _early_setup_mps
+
+        _mps_handle, _mps_env = _early_setup_mps()
+        os.environ.update(_mps_env)
+        logger.info(
+            "MPS daemon ready (pre-Ray start, started_by_us=%s, pipe_dir=%s)",
+            _mps_handle.started_by_us, _mps_handle.pipe_dir,
+        )
+
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
         driver_node_id = ray.get_runtime_context().get_node_id()
+        controller_env = get_torchspec_env_vars()
+        # Ray inherits os.environ for in-cluster workers, but the
+        # controller's runtime_env override is layered separately —
+        # explicitly include MPS pipe so the controller process
+        # joins the same MPS client world as the trainer/engine
+        # actors created later. Without this, the first
+        # `torch.cuda.is_available()` inside the controller (e.g.
+        # via tokenizer/dataset code that does `torch.cuda.*`)
+        # crashes the whole run.
+        if is_mps_colocate(args):
+            from torchspec.colocate.mps import mps_client_env as _mps_env_fn
+
+            controller_env.update(_mps_env_fn())
         controller = AsyncTrainingController.options(
-            runtime_env={"env_vars": get_torchspec_env_vars()},
+            runtime_env={"env_vars": controller_env},
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
         ).remote(args, args.dp_size)
 
@@ -321,17 +355,12 @@ def train_async_no_generation(args):
 
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
-        # MPS colocate (Phase 1): start the per-node MPS control daemon
-        # *before* placement groups so the actors that come up immediately
-        # have a daemon to register with. Idempotent: safe if Ray already
-        # started one on this node.
-        if is_mps_colocate(args):
-            handle, _env = setup_for_colocate()
-            logger.info(
-                "MPS daemon ready (started_by_us=%s, pipe_dir=%s)",
-                handle.started_by_us,
-                handle.pipe_dir,
-            )
+        # NOTE: under colocate the MPS daemon was already started
+        # in step [0] above so the controller (started in step [1])
+        # could come up with the matching CUDA_MPS_PIPE_DIRECTORY.
+        # `setup_for_colocate` is idempotent so callers expecting a
+        # handle here still get one, but we intentionally don't
+        # re-start the daemon.
         pgs = create_placement_groups(args)
         # Phase 5: in colocate (NCCL transfer) mode the entire Mooncake
         # plumbing is unused. Skip both the master daemon and the

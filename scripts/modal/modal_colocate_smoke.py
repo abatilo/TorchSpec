@@ -172,6 +172,13 @@ sglang_image = (
     .add_local_dir("patches", f"{REPO_DIR}/patches", copy=True)
     .add_local_dir("configs", f"{REPO_DIR}/configs", copy=True)
     .add_local_dir("scripts/tools", f"{REPO_DIR}/scripts/tools", copy=True)
+    # Phase-4 one-step needs the sample-conversations dataset under
+    # examples/data/ that the colocate config points at, plus the
+    # example run.sh in case future tests want to exercise the shell
+    # entrypoint directly. The directory is small (<1 MB) so the
+    # cache-invalidation cost of overlaying it on every iteration is
+    # negligible.
+    .add_local_dir("examples", f"{REPO_DIR}/examples", copy=True)
     # Layer 3: apply the Phase-4 colocate (NCCL) patch from the
     # overlaid local patches/ directory. Layered AFTER the overlay so
     # patch iteration only invalidates this thin layer's cache.

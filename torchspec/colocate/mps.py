@@ -191,6 +191,34 @@ def start_mps_daemon(
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"Timed out starting MPS daemon: {e}") from e
 
+    # The daemon's `-d` mode forks and returns immediately. The control
+    # pipe under `pipe_dir/control` is only created once the daemon's
+    # init completes. If we return here without polling, downstream
+    # actors that call `torch.cuda.set_device(...)` race with the
+    # daemon's startup and CUDA reports error 805 ("MPS client failed
+    # to connect to the MPS control daemon or the MPS server"). Poll
+    # for the pipe file so this race is impossible.
+    import time
+
+    deadline = time.time() + 10.0
+    pipe_file = os.path.join(pipe_dir, "control")
+    while time.time() < deadline:
+        if os.path.exists(pipe_file):
+            break
+        time.sleep(0.1)
+    else:
+        # Daemon failed to come up cleanly. Try to surface a helpful
+        # error rather than the obscure CUDA error 805 that downstream
+        # actors would otherwise hit.
+        raise RuntimeError(
+            f"MPS daemon did not produce {pipe_file!r} within 10s. "
+            f"Check {log_dir}/control.log on the host for daemon logs. "
+            f"Common causes: stale {pipe_dir} from a previous run "
+            f"(rm -rf and retry), incompatible CUDA driver, or container "
+            f"missing /dev/shm + /run mounts."
+        )
+    logger.info("MPS daemon ready (control pipe %s exists)", pipe_file)
+
     return MpsHandle(pipe_dir=pipe_dir, log_dir=log_dir, started_by_us=True)
 
 
