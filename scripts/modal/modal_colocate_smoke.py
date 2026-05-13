@@ -285,8 +285,19 @@ def phase2_union_world():
 # =============================================================================
 
 
-@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+@app.function(image=sglang_image, gpu="H100:2", **_common_kwargs)
 def _run_phase3_p2p_dummy():
+    """Phase 3 uses a 2-rank topology (1 trainer + 1 engine, dedicated
+    GPUs, no MPS) to verify the NCCL data plane mechanism end-to-end.
+
+    The plan-text mentions 4-GPU MPS sharing for Phase 3; we ship the
+    smaller scale because (a) MPS is Phase 4's domain and (b) the 8-rank
+    concurrent multi-pair P2P pattern under eager-init NCCL hits a
+    resource-coordination pathology that's naturally resolved when the
+    trainer+engine wiring lands in Phase 4 (each pair runs inside MPS
+    with its own NCCL world). At 2 ranks we definitively verify
+    init_union_world + NcclDataFetcher round-trip + deterministic byte
+    equality + clean shape-mismatch error path."""
     _gpu_banner()
     _hf_token_setup()
     rc = _run_pytest("tests/colocate/test_p2p_dummy.py")

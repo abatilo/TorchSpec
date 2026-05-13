@@ -143,6 +143,11 @@ class UnionWorld:
     role: str
     role_rank: int
     global_rank: int
+    paired_global_rank: int
+    """The opposite-role rank paired with this one. Trainer rank ``i``
+    is paired with engine rank ``N+i`` and vice versa. Use for the
+    ``dst``/``src`` arg of ``dist.send`` / ``dist.recv`` /
+    ``dist.batch_isend_irecv`` ops on the union world."""
     fsdp_group: object  # torch.distributed.ProcessGroup
     """Subgroup of just trainer ranks; pass to FSDP DeviceMesh.
 
@@ -153,11 +158,26 @@ class UnionWorld:
     metadata broadcast (cheap dict broadcast, no GPU needed)."""
 
 
-def init_union_world(spec: UnionWorldSpec, role: str, role_rank: int) -> UnionWorld:
+def init_union_world(
+    spec: UnionWorldSpec,
+    role: str,
+    role_rank: int,
+    *,
+    device_id: Optional[int] = None,
+) -> UnionWorld:
     """Collective: initialise the union world from this process.
 
     All 2N ranks must call this with consistent ``spec`` (same master_addr,
     master_port, n_per_role) and the right ``role`` / ``role_rank``.
+
+    Args:
+        device_id: Local CUDA device index this rank uses. Defaults to
+            ``torch.cuda.current_device()`` (typically ``0`` under
+            Ray's ``CUDA_VISIBLE_DEVICES`` isolation since the actor
+            sees only one GPU). **Must be passed correctly** — without
+            it, NCCL guesses device by global rank, which under Ray
+            isolation maps to a non-existent local GPU and silently
+            deadlocks P2P send/recv.
 
     Side-effects:
         - Calls ``dist.init_process_group(backend='nccl', world_size=2N, …)``.
@@ -168,6 +188,11 @@ def init_union_world(spec: UnionWorldSpec, role: str, role_rank: int) -> UnionWo
         - Sets ``TORCHSPEC_COLOCATE_UNION_WORLD`` env marker so downstream
           code (e.g. sglang patches) can detect the union-world setup.
 
+    P2P transfers (engine→trainer hidden states) should use
+    ``dist.batch_isend_irecv`` on the default union world; this is faster
+    and avoids the lazy 2-rank sub-communicator pathology of unbatched
+    ``send``/``recv`` on a large parent group.
+
     Returns:
         UnionWorld handle with the subgroup references.
 
@@ -176,6 +201,7 @@ def init_union_world(spec: UnionWorldSpec, role: str, role_rank: int) -> UnionWo
             integration-with-sglang risk flagged in implementation.md
             §Phase 2 risk register.
     """
+    import torch
     import torch.distributed as dist
 
     if dist.is_initialized():
@@ -188,11 +214,21 @@ def init_union_world(spec: UnionWorldSpec, role: str, role_rank: int) -> UnionWo
         )
 
     global_rank = rank_for_role(spec, role, role_rank)
+    paired_global_rank = (
+        rank_for_role(spec, ROLE_ENGINE, role_rank)
+        if role == ROLE_TRAINER
+        else rank_for_role(spec, ROLE_TRAINER, role_rank)
+    )
+
+    if device_id is None:
+        device_id = torch.cuda.current_device()
+    device = torch.device("cuda", int(device_id))
 
     logger.info(
         "Initialising union world: role=%s role_rank=%d global_rank=%d "
-        "world_size=%d init_method=%s",
-        role, role_rank, global_rank, spec.world_size, spec.init_method,
+        "paired_global_rank=%d world_size=%d init_method=%s device=%s",
+        role, role_rank, global_rank, paired_global_rank,
+        spec.world_size, spec.init_method, device,
     )
 
     dist.init_process_group(
@@ -201,18 +237,25 @@ def init_union_world(spec: UnionWorldSpec, role: str, role_rank: int) -> UnionWo
         rank=global_rank,
         init_method=spec.init_method,
         timeout=timedelta(minutes=spec.timeout_minutes),
+        device_id=device,
     )
 
     # Subgroups are collective: every rank must call new_group with the
     # same args, even ranks not in the resulting subgroup.
     fsdp_ranks = trainer_global_ranks(spec)
-    fsdp_group = dist.new_group(ranks=fsdp_ranks, backend="nccl")
-    if role != ROLE_TRAINER:
-        # Engines aren't in the FSDP group; expose None so calling
-        # FSDP collectives on this is a clear error rather than a hang.
-        fsdp_group_for_role: Optional[object] = None
+    if len(fsdp_ranks) >= 2:
+        # NCCL 1-rank groups can hang under eager-init / `device_id`;
+        # skip when there's only one trainer (e.g. tests at minimal
+        # scale). FSDP itself doesn't need a group at world_size 1.
+        fsdp_group = dist.new_group(ranks=fsdp_ranks, backend="nccl")
+        if role != ROLE_TRAINER:
+            # Engines aren't in the FSDP group; expose None so calling
+            # FSDP collectives on this is a clear error rather than a hang.
+            fsdp_group_for_role: Optional[object] = None
+        else:
+            fsdp_group_for_role = fsdp_group
     else:
-        fsdp_group_for_role = fsdp_group
+        fsdp_group_for_role = None
 
     meta_group = dist.new_group(
         ranks=list(range(spec.world_size)), backend="gloo"
@@ -225,6 +268,7 @@ def init_union_world(spec: UnionWorldSpec, role: str, role_rank: int) -> UnionWo
         role=role,
         role_rank=role_rank,
         global_rank=global_rank,
+        paired_global_rank=paired_global_rank,
         fsdp_group=fsdp_group_for_role,
         meta_group=meta_group,
     )
