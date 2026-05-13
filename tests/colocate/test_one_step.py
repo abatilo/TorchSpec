@@ -126,13 +126,25 @@ def test_phase4_one_step_completes_end_to_end(tmp_path: Path):
         timeout=1100,
     )
 
-    # Always print a tail of the captured logs so a failure message
-    # has the actual NCCL/sglang error visible in pytest output.
     tail = (proc.stdout + proc.stderr).splitlines()
-    print("\n=== one-step run last 200 lines ===")
-    for line in tail[-200:]:
+    print("\n=== one-step run last 400 lines ===")
+    for line in tail[-400:]:
         print(line)
-    print("=== /one-step run last 200 lines ===\n")
+    print("=== /one-step run last 400 lines ===\n")
+
+    if proc.returncode != 0:
+        # MPS-related crashes only surface their root cause in the
+        # daemon's control.log on the node. Dump it explicitly so
+        # the pytest output has the actual reason.
+        for log_path in ("/tmp/nvidia-log/control.log", "/tmp/nvidia-log/server.log"):
+            p = Path(log_path)
+            if p.exists():
+                print(f"\n=== {log_path} (last 4KB) ===")
+                with open(p, "rb") as f:
+                    print(f.read()[-4096:].decode("utf-8", errors="replace"))
+                print(f"=== /{log_path} ===\n")
+            else:
+                print(f"\n[{log_path} not present]\n")
 
     assert proc.returncode == 0, (
         f"train_entry exited with code {proc.returncode}; see captured "
