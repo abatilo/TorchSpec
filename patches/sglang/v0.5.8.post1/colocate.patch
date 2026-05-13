@@ -1,82 +1,15 @@
-From a2039d872c7ecd5b24974392beef8e5d4cd6e72b Mon Sep 17 00:00:00 2001
+From 65f03e668c32cd920328f851535da2371e6eb331 Mon Sep 17 00:00:00 2001
 From: xinghandd <xing.han@doordash.com>
-Date: Tue, 12 May 2026 23:30:03 -0700
-Subject: [PATCH] TorchSpec colocate (NCCL) patch: union-world join +
- spec_training NCCL writer
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Tue, 12 May 2026 23:32:09 -0700
+Subject: [PATCH] Re-apply colocate patch (round-trip verified)
 
-Adds the engine-side support for TorchSpec's colocate (MPS + NCCL)
-training mode, gated entirely behind the env-var sentinel
-TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl. When the sentinel is unset
-(disaggregated path), the patch is a structural no-op — both flag
-checks short-circuit and the existing Mooncake KV-store path runs
-unchanged.
-
-What this patch implements:
-* `python/sglang/srt/distributed/torchspec_colocate.py` (new) —
-  self-contained helper module: parses TorchSpec's env-var contract
-  (TORCHSPEC_COLOCATE_*), joins the 2N-rank union NCCL world as the
-  default PG via init_process_group with device_id (Phase-3 lesson:
-  device_id is required to avoid NCCL guessing GPU-by-rank under
-  Ray's CUDA_VISIBLE_DEVICES isolation), and lazily imports
-  TorchSpec's NcclHiddenStatesConnector for the spec_training writer.
-* `parallel_state.py::initialize_model_parallel` — accepts a new
-  optional `tp_world_ranks` kwarg. When passed (colocate), it skips
-  the `world_size == tp_size * pp_size` assertion (the engine half
-  of the union world is `[N, 2N)`, world_size is 2N), uses that
-  exact rank list as the single TP group, and creates singleton PP
-  groups (pp_size==1 invariant for colocate). Defends against
-  non-default MoE-EP/MoE-TP layouts under colocate, which would
-  otherwise build broken groups via linear rank arithmetic.
-* `model_executor/model_runner.py` — branches at the
-  init_distributed_environment / initialize_model_parallel call site.
-  When colocate is active, calls torchspec_colocate.init_union_default_pg
-  (which brings up the 2N-rank union world), then calls
-  init_distributed_environment redundantly (it sees dist already up
-  and only sets sglang's `_WORLD` to a 2N-rank world group), then
-  calls initialize_model_parallel with the explicit `tp_world_ranks`
-  derived from the union env. Disagg path is unchanged.
-* `managers/scheduler.py::Scheduler.__init__` — adds
-  `self.eagle_nccl_writer` next to `self.eagle_mooncake_store`.
-  Skips the Mooncake background-init thread under colocate. After
-  init_model_worker brings up torch.distributed, instantiates the
-  NcclHiddenStatesConnector on every TP rank (each TP rank pairs
-  1:1 with one trainer rank in the union world).
-* `managers/scheduler_output_processor_mixin.py` — adds
-  `_send_hidden_states_to_nccl`, mirrors `_send_hidden_states_to_mooncake`
-  but writes to the NCCL connector instead of the Mooncake KV store.
-  `_process_hidden_states_for_req` branches: NCCL writer takes
-  precedence when both are somehow set (defensive — they should be
-  mutually exclusive). Tensors built into the dict the trainer
-  fetcher's sorted-by-key walk expects: `hidden_states`, `input_ids`,
-  `last_hidden_states` (when set), `aux_hidden_states` (when set).
-
-What this patch does NOT do (out of scope per implementation.md):
-* Multi-node colocate.
-* Mixed colocate + disagg in the same job.
-* tp_size > 1 has been considered structurally (initialize_model_parallel
-  takes tp_world_ranks regardless), but the only actively tested
-  colocate config is tp_size=1. Larger TP needs the same tp_world_ranks
-  threading without changes here.
-
-Verified locally:
-* All five patched files (torchspec_colocate.py + 4 modified) parse
-  cleanly via `ast.parse`.
-* End-to-end NCCL P2P (the `phase4_one_step` Modal target) needs the
-  matching TorchSpec branch and physical GPUs; deferred to Modal.
-
-AI-assisted (Claude). Human submitter reviewed.
-
-Co-authored-by: Claude
 ---
  .../sglang/srt/distributed/parallel_state.py  |  75 ++++-
  .../srt/distributed/torchspec_colocate.py     | 258 ++++++++++++++++++
  python/sglang/srt/managers/scheduler.py       |  39 ++-
- .../scheduler_output_processor_mixin.py       |  85 +++++-
+ .../scheduler_output_processor_mixin.py       |  84 +++++-
  .../sglang/srt/model_executor/model_runner.py |  73 ++++-
- 5 files changed, 500 insertions(+), 30 deletions(-)
+ 5 files changed, 499 insertions(+), 30 deletions(-)
  create mode 100644 python/sglang/srt/distributed/torchspec_colocate.py
 
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
@@ -523,7 +456,7 @@ index f8c65272c..c234e1816 100644
              time.sleep(t)
  
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index 2f114c70e..c2b745791 100644
+index 2f114c70e..ff1da02c0 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 @@ -852,13 +852,35 @@ class SchedulerOutputProcessorMixin:
@@ -563,7 +496,7 @@ index 2f114c70e..c2b745791 100644
              batch.spec_training_info is not None
              and batch.spec_training_info.has_request(req.rid)
              and self.eagle_mooncake_store is not None
-@@ -940,6 +962,67 @@ class SchedulerOutputProcessorMixin:
+@@ -940,6 +962,66 @@ class SchedulerOutputProcessorMixin:
          req.spec_training_mooncake_store_keys.append(key)
          batch.spec_training_info.mooncake_store_keys[data_id].append(key)
  
@@ -609,22 +542,21 @@ index 2f114c70e..c2b745791 100644
 +            torch.cuda.current_stream().wait_event(copy_done_event)
 +
 +        # Build the dict the trainer fetcher expects. Keys must match
-+        # ColocateTrainSample.tensor_specs (sorted-by-key on both sides).
-+        # `aux_hidden_states` is appended only when it's actually present
-+        # — Eagle3 with no aux layers omits it.
++        # ColocateTrainSample.tensor_specs (both sides walk
++        # sorted(keys)). The shape contract is the same as the disagg
++        # Mooncake path: `hidden_states` is already concatenated across
++        # aux layers by sglang's spec_training code (so its last dim is
++        # `num_aux_layers * model_hidden_size` when aux layers are
++        # enabled, otherwise `model_hidden_size`). We do NOT ship a
++        # separate `aux_hidden_states` tensor — the trainer's data
++        # fetcher consumes the concat directly, matching what the
++        # Mooncake-backed `MooncakeDataset` produces.
 +        tensors = {
 +            "hidden_states": hidden_states.contiguous(),
 +            "input_ids": input_ids,
 +        }
 +        if last_hidden_states is not None:
 +            tensors["last_hidden_states"] = last_hidden_states.contiguous()
-+        if (
-+            getattr(logits_output, "aux_hidden_states", None) is not None
-+        ):
-+            aux = logits_output.aux_hidden_states[
-+                hidden_state_offset : hidden_state_offset + seq_len
-+            ]
-+            tensors["aux_hidden_states"] = aux.contiguous()
 +
 +        self.eagle_nccl_writer.send(tensors)
 +

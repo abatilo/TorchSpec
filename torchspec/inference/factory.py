@@ -63,12 +63,27 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
     return engines
 
 
-def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
+def prepare_inference_engines(
+    args,
+    inference_pg,
+    mooncake_config,
+    engine_group: int = 0,
+    extra_env_vars: dict | None = None,
+):
     """Create inference engines and fire init calls without waiting.
 
     Use this to parallelize engine initialization with other setup work
     (e.g., training actor initialization). Call ray.get() on the returned
     init_refs before using the engines.
+
+    Args:
+        extra_env_vars: Optional dict of extra env vars to inject into the
+            engine actors' ``runtime_env``. Used by the colocate path to
+            ship the driver-computed ``TORCHSPEC_COLOCATE_UNION_*``
+            rendezvous params + ``TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl``
+            into engines BEFORE they spawn sglang. Without this, the
+            sglang patch wouldn't see the env contract and would fall
+            through to the disagg path.
 
     Returns:
         Tuple of (head_engines, init_refs) where head_engines are the engines
@@ -84,7 +99,10 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     if engine_type == "hf":
         engines, init_refs = _prepare_hf_engines(args, inference_pg, mooncake_config, engine_group)
     elif engine_type == "sgl":
-        engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config, engine_group)
+        engines, init_refs = _prepare_sgl_engines(
+            args, inference_pg, mooncake_config, engine_group,
+            extra_env_vars=extra_env_vars,
+        )
     else:
         engines, init_refs = _prepare_vllm_engines(
             args, inference_pg, mooncake_config, engine_group
@@ -152,7 +170,8 @@ def _init_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> l
 
 
 def _prepare_sgl_engines(
-    args, pg, mooncake_config=None, engine_group: int = 0
+    args, pg, mooncake_config=None, engine_group: int = 0,
+    extra_env_vars: dict | None = None,
 ) -> tuple[list, list]:
     """Create SGL engine actors and fire init calls without waiting.
 
@@ -211,6 +230,12 @@ def _prepare_sgl_engines(
     else:
         sgl_num_gpus = 0.2
         sgl_num_cpus = 0.2
+
+    # Driver-supplied env vars (e.g. colocate union-world rendezvous params)
+    # win over any defaults set above. Layered last so they cannot be
+    # accidentally clobbered by the local mode-specific overrides.
+    if extra_env_vars:
+        env_vars = {**env_vars, **extra_env_vars}
 
     # Step 1: Create all engine actors (without calling init yet)
     engines = []

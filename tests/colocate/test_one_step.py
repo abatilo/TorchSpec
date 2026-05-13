@@ -1,0 +1,129 @@
+# Copyright (c) 2026 LightSeek Foundation
+# MIT License
+
+"""Phase 4 / 5 e2e smoke: one full colocate (MPS + NCCL) training step.
+
+Spawns a real ``train_entry.py`` run with the colocate Qwen3-8B config,
+forces ``num_train_steps=1``, and asserts:
+
+* the process exits 0 (didn't hang on rendezvous, didn't OOM, didn't
+  hit the legacy NotImplementedError branch);
+* the loop reports ``completed_steps=1 / num_steps=1`` (i.e. the
+  forward-backward-NCCL-recv chain actually ran one step end-to-end).
+
+This is the maximal e2e check we can run on a Modal sandbox H100:4 in
+~15 minutes, so we use it as the gate that the patched sglang + the
+TorchSpec colocate orchestration are wired together correctly.
+
+Failure modes we want to catch loudly:
+
+* deadlock at union-world rendezvous (would hang forever — pytest
+  timeout fires)
+* MPS daemon not running (subprocess crash before training)
+* tensor-spec mismatch between trainer fetcher + engine sender (NCCL
+  recv would block forever or trigger CUDA "size mismatch" error)
+* wrong ``aux_hidden_states_layers`` resolution (last-dim mismatch on
+  ``hidden_states``)
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+pytestmark = pytest.mark.timeout(1200)
+
+
+def _has_h100_quad() -> bool:
+    """Detect whether we're on a Modal H100:4 (or a dev box with 4+ GPUs)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    gpus = [g.strip() for g in out.splitlines() if g.strip()]
+    return len(gpus) >= 4
+
+
+@pytest.mark.skipif(
+    not _has_h100_quad(),
+    reason=(
+        "Phase-4 one-step requires >=4 GPUs (Qwen3-8B with 4 trainers + "
+        "4 engines colocated via MPS)."
+    ),
+)
+def test_phase4_one_step_completes_end_to_end(tmp_path: Path):
+    """Run a single colocate training step end-to-end through train_entry."""
+
+    config_path = REPO_ROOT / "configs" / "colocate_qwen3_8b.yaml"
+    assert config_path.exists(), config_path
+    run_sh = REPO_ROOT / "examples" / "colocate-qwen3-8b-1node" / "run.sh"
+    assert run_sh.exists(), run_sh
+
+    # Sandbox the run output under tmp_path so pytest's rmtree works.
+    out_dir = tmp_path / "outputs"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir()
+    cache_dir.mkdir()
+
+    env = os.environ.copy()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("TORCHSPEC_LOG_LEVEL", "INFO")
+    env.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    # Surface NCCL diagnostics — if the rendezvous deadlocks, the
+    # last NCCL line in the captured output tells us why.
+    env.setdefault("NCCL_DEBUG", "WARN")
+
+    cmd = [
+        "bash", str(run_sh), str(config_path),
+        "training.num_train_steps=1",
+        "training.num_epochs=1",
+        f"output_dir={out_dir}",
+        f"cache_dir={cache_dir}",
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1100,
+    )
+
+    # Always print a tail of the captured logs so a failure message
+    # has the actual NCCL/sglang error visible in pytest output.
+    tail = (proc.stdout + proc.stderr).splitlines()
+    print("\n=== one-step run last 200 lines ===")
+    for line in tail[-200:]:
+        print(line)
+    print("=== /one-step run last 200 lines ===\n")
+
+    assert proc.returncode == 0, (
+        f"train_entry exited with code {proc.returncode}; see captured "
+        f"output above for the actual error."
+    )
+
+    completed_marker = "completed_steps=1 / num_steps=1"
+    assert any(completed_marker in line for line in tail), (
+        f"Expected log line containing {completed_marker!r} not found. "
+        f"This means the colocate loop didn't reach the end of step 1 — "
+        f"the rendezvous succeeded but the forward/backward/recv chain "
+        f"failed silently. Last 50 lines:\n"
+        + "\n".join(tail[-50:])
+    )
+
+    # Output dir cleanup is the responsibility of pytest's tmp_path teardown.
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)

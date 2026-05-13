@@ -134,6 +134,14 @@ class RayTrainGroup:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)
 
+        # Expose the rendezvous address so the driver can derive the colocate
+        # union-world endpoint and inject the matching env vars into the
+        # engine actors' runtime_env BEFORE engines spawn sglang. Without
+        # this, the engines would have no way to discover the trainer-side
+        # master_port the union world is rendezvousing on.
+        self.master_addr = master_addr
+        self.master_port = master_port
+
     def async_init(self, args, role, mooncake_config=None, with_ref=False):
         """
         Allocate GPU resourced and initialize model, optimzier, local ckpt, etc.

@@ -381,6 +381,40 @@ def train_async_no_generation(args):
             pg=pgs["training"],
             training_class=TrainerActor,
         )
+
+        # Phase 4/5: Driver-computed colocate union-world rendezvous params.
+        # The trainer rank-0 already self-discovered its master_addr/port
+        # via setup_master in its constructor — we read them off the
+        # train_group, derive the union-world endpoint (port + 5000), and
+        # inject the env contract into BOTH the driver process (so trainer
+        # actors created below see it via Ray's child env propagation) and
+        # the engine actors' runtime_env (so they see it before they
+        # spawn the sglang TP scheduler subprocess).
+        engine_extra_env: dict[str, str] = {}
+        if is_mps_colocate(args):
+            n_per_role = args.training_num_nodes * args.training_num_gpus_per_node
+            union_master_addr = train_group.master_addr
+            union_master_port = int(train_group.master_port) + 5000
+            union_timeout_min = int(getattr(args, "distributed_timeout_minutes", 30))
+            union_env = {
+                "TORCHSPEC_COLOCATE_TRANSFER_MODE": "nccl",
+                "TORCHSPEC_COLOCATE_UNION_MASTER_ADDR": str(union_master_addr),
+                "TORCHSPEC_COLOCATE_UNION_MASTER_PORT": str(union_master_port),
+                "TORCHSPEC_COLOCATE_UNION_WORLD_SIZE": str(2 * n_per_role),
+                "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE": str(n_per_role),
+                "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN": str(union_timeout_min),
+            }
+            for k, v in union_env.items():
+                os.environ[k] = v
+            engine_extra_env = union_env
+            logger.info(
+                "[colocate] Driver-computed union rendezvous: %s:%d "
+                "(world_size=2*%d=%d, timeout=%dmin). Injecting into engine "
+                "runtime_env so the patched sglang sees it before init.",
+                union_master_addr, union_master_port, n_per_role,
+                2 * n_per_role, union_timeout_min,
+            )
+
         train_init_refs = train_group.async_init(
             args, role="training", mooncake_config=mooncake_config, with_ref=False
         )
@@ -391,32 +425,29 @@ def train_async_no_generation(args):
         # dispatched after to maximize parallelism with the wait below.
         _maybe_create_scratch_draft(args, train_group)
 
-        # Phase 6 init-order fence (colocate only): wait for trainer
-        # actors to finish initialising before we kick off engine init.
-        # Under MPS, the trainer + engine share one memory pool; if
-        # both come up in parallel, sglang's mem_fraction_static
-        # accounting can race against FSDP's allocator and either side
-        # may OOM the other. Sequencing trainer-first guarantees the
-        # trainer has claimed its `train_frac` chunk before sglang
-        # tries to allocate KV cache. The disaggregated path keeps the
-        # original parallel init for cold-start latency.
-        if is_mps_colocate(args):
-            logger.info(
-                "[colocate] Waiting for %d trainer actors to finish init "
-                "before starting %d engines (memory-sharing fence).",
-                len(train_init_refs),
-                getattr(args, "inference_num_gpus", 0),
-            )
-            ray.get(train_init_refs)
-            train_init_refs = []  # already collected; don't double-await below
+        # NOTE: the previous "init-order fence" that awaited trainer init
+        # before kicking off engines is incompatible with the colocate
+        # union-world rendezvous, which is COLLECTIVE across all 2N ranks.
+        # If we waited on trainer init here, every trainer's
+        # init_process_group(world_size=2N) would block forever waiting
+        # for engines that hadn't been spawned. Instead we let trainer
+        # init and engine init run in parallel; both block on the
+        # rendezvous, both unblock together. Memory contention under
+        # MPS is handled by `expandable_segments:True` + the
+        # train_frac/infer_frac budget split (no double-allocation
+        # because both sides start tiny and grow into their share).
 
         inference_engines, engine_init_refs = prepare_inference_engines(
-            args, pgs["inference"], mooncake_config
+            args, pgs["inference"], mooncake_config,
+            extra_env_vars=engine_extra_env if is_mps_colocate(args) else None,
         )
 
-    # [8] Wait for all actor init to complete concurrently. (In
-    # colocate mode train_init_refs is empty — already awaited at the
-    # init-order fence above; we still wait on engine refs here.)
+    # [8] Wait for all actor init to complete concurrently. Under
+    # colocate mode this is also where the union-world rendezvous
+    # collectively unblocks — every trainer + engine rank is sitting
+    # inside dist.init_process_group(world_size=2N) until ALL of them
+    # call it. Awaiting both sets of refs together is what allows
+    # progress.
     n_train = len(train_init_refs)
     logger.info(
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
@@ -451,21 +482,17 @@ def train_async_no_generation(args):
     timer.log_summary()
 
     if is_mps_colocate(args):
-        # The synchronous colocate training loop is not yet implemented
-        # in this repo: it requires the upstream sglang patch (see
-        # docs/colocate/sglang_patch.md) before the engine→trainer P2P
-        # data plane is end-to-end. Once that lands, this branch should
-        # call run_colocate_training_loop(args, controller, train_group,
-        # inference_engines, ...). The pre-loop wiring (controller actor,
-        # train_group, inference_engines, train queues) is fully set up
-        # at this point, so the loop is the only remaining gap.
-        raise NotImplementedError(
-            "Colocate (transfer_mode='nccl') training requires the upstream "
-            "sglang patch (see docs/colocate/sglang_patch.md) plus the "
-            "synchronous run_colocate_training_loop, which is the Phase 5 "
-            "follow-up. To run inference-only or the multi-tensor smoke "
-            "test, see scripts/modal/modal_colocate_smoke.py::phase4_multi_tensor."
+        from torchspec.controller.colocate_loop import run_colocate_training_loop
+
+        run_colocate_training_loop(
+            args,
+            controller,
+            train_group,
+            inference_engines=inference_engines,
+            dataset_size=dataset_size,
+            eval_dataset_size=eval_dataset_size,
         )
+        return
 
     # [10] Run training loop (no ray.put needed — dataset lives on controller)
     run_training_loop(

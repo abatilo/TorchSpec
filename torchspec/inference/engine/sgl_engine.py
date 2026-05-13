@@ -536,6 +536,20 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         results = self._engine.generate(**engine_kwargs)
 
+        # In colocate (NCCL) mode the patched sglang spec_training callback
+        # writes hidden states directly to the paired trainer rank via NCCL
+        # P2P; no Mooncake keys are produced. The post-processing below is
+        # entirely about building Mooncake-key-shaped output dicts, so just
+        # short-circuit and return an empty list. The driver-side colocate
+        # loop relies on the side-effect (NCCL send) and discards the
+        # return value.
+        if (getattr(self.args, "transfer_mode", None) or "mooncake") == "nccl":
+            logger.debug(
+                f"SglEngine rank {self.rank}: colocate (nccl) generate "
+                f"complete for {len(results)} requests; no mooncake outputs."
+            )
+            return []
+
         # Extract mooncake keys and construct shapes based on actual sequence length
         outputs = []
         for i, result in enumerate(results):

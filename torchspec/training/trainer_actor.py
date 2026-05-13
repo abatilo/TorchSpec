@@ -67,35 +67,61 @@ class TrainerActor(RayActor):
         ranks share one default PG of size ``2N`` so the engine can do a
         ``dist.send`` to its paired trainer with no shared store.
 
-        The trainer process is the easy half. The engine side must be
-        bootstrapped from inside sglang's TP scheduler subprocess by an
-        upstream sglang patch (see ``docs/colocate/sglang_patch.md``).
-        We surface the rendezvous params via env vars so the patch can
-        read them out of the scheduler subprocess's env without needing
-        a side-channel:
+        The rendezvous parameters (``TORCHSPEC_COLOCATE_UNION_*``) are
+        computed once on the **driver** (see ``train_entry.py``) and
+        injected into both trainer and engine actors via Ray's
+        ``runtime_env.env_vars``. This ensures both sides see exactly
+        the same master_addr / master_port, eliminates an entire class
+        of "trainer picked port X but engine expected Y" race conditions,
+        and means the engine subprocess inherits the env from its actor
+        without any additional side-channel.
 
-          - ``TORCHSPEC_COLOCATE_UNION_MASTER_ADDR``
-          - ``TORCHSPEC_COLOCATE_UNION_MASTER_PORT``
-          - ``TORCHSPEC_COLOCATE_UNION_WORLD_SIZE`` (= 2N)
-          - ``TORCHSPEC_COLOCATE_UNION_N_PER_ROLE`` (= N)
-          - ``TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN``
-
-        Setting these on the *trainer* process won't affect the engine
-        subprocesses directly — that's what the SglEngine env-export +
-        sglang patch is for. We set them here for parity / debugging.
+        Falls back to the legacy self-computed spec
+        (``master_port + _COLOCATE_UNION_WORLD_PORT_OFFSET``) when the
+        driver hasn't pre-set the env vars — kept so existing tests that
+        spin up TrainerActor in isolation still work.
         """
-        spec = UnionWorldSpec(
-            n_per_role=self._world_size,
-            master_addr=self.master_addr,
-            master_port=int(self.master_port) + _COLOCATE_UNION_WORLD_PORT_OFFSET,
-            timeout_minutes=int(getattr(args, "distributed_timeout_minutes", 30)),
-        )
+        timeout_min_arg = int(getattr(args, "distributed_timeout_minutes", 30))
 
-        os.environ["TORCHSPEC_COLOCATE_UNION_MASTER_ADDR"] = spec.master_addr
-        os.environ["TORCHSPEC_COLOCATE_UNION_MASTER_PORT"] = str(spec.master_port)
-        os.environ["TORCHSPEC_COLOCATE_UNION_WORLD_SIZE"] = str(spec.world_size)
-        os.environ["TORCHSPEC_COLOCATE_UNION_N_PER_ROLE"] = str(spec.n_per_role)
-        os.environ["TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN"] = str(spec.timeout_minutes)
+        env_master_addr = os.environ.get("TORCHSPEC_COLOCATE_UNION_MASTER_ADDR")
+        env_master_port = os.environ.get("TORCHSPEC_COLOCATE_UNION_MASTER_PORT")
+        env_world_size = os.environ.get("TORCHSPEC_COLOCATE_UNION_WORLD_SIZE")
+        env_n_per_role = os.environ.get("TORCHSPEC_COLOCATE_UNION_N_PER_ROLE")
+
+        if all((env_master_addr, env_master_port, env_world_size, env_n_per_role)):
+            n_per_role = int(env_n_per_role)
+            world_size = int(env_world_size)
+            if world_size != 2 * n_per_role:
+                raise RuntimeError(
+                    f"Inconsistent colocate union env: world_size={world_size}, "
+                    f"n_per_role={n_per_role} (expected world_size == 2 * n_per_role)"
+                )
+            if n_per_role != self._world_size:
+                raise RuntimeError(
+                    f"Driver-set TORCHSPEC_COLOCATE_UNION_N_PER_ROLE={n_per_role} "
+                    f"!= trainer world_size={self._world_size}. The driver must "
+                    f"compute n_per_role from the trainer count."
+                )
+            spec = UnionWorldSpec(
+                n_per_role=n_per_role,
+                master_addr=env_master_addr,
+                master_port=int(env_master_port),
+                timeout_minutes=int(
+                    os.environ.get("TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN", timeout_min_arg)
+                ),
+            )
+        else:
+            spec = UnionWorldSpec(
+                n_per_role=self._world_size,
+                master_addr=self.master_addr,
+                master_port=int(self.master_port) + _COLOCATE_UNION_WORLD_PORT_OFFSET,
+                timeout_minutes=timeout_min_arg,
+            )
+            os.environ["TORCHSPEC_COLOCATE_UNION_MASTER_ADDR"] = spec.master_addr
+            os.environ["TORCHSPEC_COLOCATE_UNION_MASTER_PORT"] = str(spec.master_port)
+            os.environ["TORCHSPEC_COLOCATE_UNION_WORLD_SIZE"] = str(spec.world_size)
+            os.environ["TORCHSPEC_COLOCATE_UNION_N_PER_ROLE"] = str(spec.n_per_role)
+            os.environ["TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN"] = str(spec.timeout_minutes)
 
         union = init_union_world(spec, role=ROLE_TRAINER, role_rank=self._rank)
         self._union_world = union
