@@ -38,20 +38,22 @@ def has_h100_quad() -> bool:
     return has_n_gpus(4)
 
 
-def mps_works() -> bool:
-    """True iff nvidia-cuda-mps-control is on PATH and the per-GPU
-    server can actually start a CUDA context. False on hosts where
-    the MPS server reports 'operation not supported' (e.g. Modal
-    sandbox H100 nodes without --ipc=host); see
-    docs/colocate/implementation_log.md for the full story.
+def mps_works_verbose() -> tuple[bool, str]:
+    """Like :func:`mps_works` but returns ``(ok, reason)``.
+
+    ``reason`` is a single-line human-readable string suitable for
+    logging or printing to stderr. On failure it tries to extract the
+    most diagnostic line from ``/tmp/nvidia-log/server.log`` (e.g.
+    ``"operation not supported"``) so callers can tell ``no --ipc=host``
+    apart from e.g. ``CUDA driver too old``.
 
     Implementation mirrors
-    ``torchspec.colocate.mps._probe_mps_server_works`` but is kept
-    here so test files don't need to import torchspec just to gate
-    their pytest ``skipif``.
+    ``torchspec.colocate.mps._probe_mps_server_works`` but is kept here
+    so test files (and ``scripts/colocate/run_smoke_host.sh``) don't
+    need to import torchspec just to gate their pytest ``skipif``.
     """
     if not shutil.which("nvidia-cuda-mps-control"):
-        return False
+        return False, "nvidia-cuda-mps-control not on PATH (install CUDA toolkit)"
     pipe_dir = "/tmp/nvidia-mps"
     log_dir = "/tmp/nvidia-log"
     try:
@@ -82,6 +84,47 @@ def mps_works() -> bool:
             env=env, timeout=20,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
-        return proc.returncode == 0
-    except Exception:
-        return False
+        if proc.returncode == 0:
+            return True, "ok"
+
+        server_log = os.path.join(log_dir, "server.log")
+        detail = ""
+        if os.path.exists(server_log):
+            with open(server_log, "rb") as f:
+                tail = f.read()[-2048:].decode("utf-8", errors="replace")
+            if "operation not supported" in tail:
+                detail = (
+                    " — MPS server reports 'operation not supported' "
+                    "(container likely lacks --ipc=host; switch host/template)"
+                )
+            elif tail.strip():
+                detail = f" (server.log tail: {tail.strip().splitlines()[-1]!r})"
+        return False, (
+            f"cuInit/cuDeviceGetCount returned rc={proc.returncode}{detail}"
+        )
+    except Exception as e:
+        return False, f"unexpected exception during MPS probe: {e!r}"
+
+
+def mps_works() -> bool:
+    """True iff nvidia-cuda-mps-control is on PATH and the per-GPU
+    server can actually start a CUDA context. False on hosts where
+    the MPS server reports 'operation not supported' (e.g. Modal
+    sandbox H100 nodes without --ipc=host); see
+    docs/colocate/implementation_log.md for the full story.
+
+    Thin wrapper over :func:`mps_works_verbose` for the common case of
+    a pytest ``skipif`` predicate that only needs a bool.
+    """
+    return mps_works_verbose()[0]
+
+
+if __name__ == "__main__":
+    # CLI: print the verbose reason and exit 0/1. Used by
+    # ``scripts/colocate/run_smoke_host.sh`` for the pre-flight gate
+    # and by humans following the doc's "Quick MPS sanity check".
+    import sys
+
+    ok, reason = mps_works_verbose()
+    print(f"mps_works: {ok} — {reason}")
+    sys.exit(0 if ok else 1)

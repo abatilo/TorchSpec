@@ -43,31 +43,40 @@
 #   PYTHON=python3.11                  # default whatever python3 is on PATH
 #   PIP_INDEX_URL=...                  # default PyPI
 #   COLOCATE_PIN_TORCH=1               # pin torch==2.5.* if you hit a wheel mismatch
+#   COLOCATE_SKIP_MPS_PROBE=1          # skip pre-flight MPS probe (let tests SKIP)
+#   COLOCATE_KEEP_MPS=1                # don't tear MPS daemon down on script exit
 #
 # Exit codes:
-#   0 — every selected test either PASSED or SKIPPED (clean)
-#   1 — host pre-flight failed (no GPU / no MPS binary / no driver)
+#   0 — every selected test either PASSED or SKIPPED cleanly
+#   1 — host pre-flight failed (no GPU / no MPS binary / MPS probe fails /
+#       no CUDA driver). The pre-flight MPS probe means a host without
+#       working MPS now exits 1 here instead of running tests that would
+#       all SKIP; set COLOCATE_SKIP_MPS_PROBE=1 to revert to the old
+#       "skip tests cleanly" behavior.
 #   2 — invalid CLI flag
 #   non-0 from pytest — at least one test FAILED; see captured log
 #
 # What it does:
-#   1. (setup) Clone sglang at the pinned commit and apply both patches
+#   1. (pre-flight) nvidia-smi visible, >=1 GPU, MPS daemon binary on
+#      PATH, MPS server can actually spawn a CUDA context (cuInit probe).
+#      Cleans up stale Ray + MPS state from previous runs.
+#   2. (setup) Clone sglang at the pinned commit and apply both patches
 #      (the existing disagg sglang.patch and our new colocate.patch).
-#   2. (setup) `pip install -e .` torchspec + sglang in --user mode so
+#   3. (setup) `pip install -e .` torchspec + sglang in --user mode so
 #      the host python sees them.
-#   3. (run)   Pre-flight: report nvidia-smi, MPS daemon, GPU count.
 #   4. (run)   `pytest tests/colocate/test_colocate_tiny.py -xvs`
-#              — this is the 1-GPU + Qwen3-0.6B variant of Phase-4
-#              one-step + Phase-7 mini convergence. The MPS skip gate
-#              (tests/colocate/_mps_probe.py::mps_works) auto-skips with
-#              a clear reason on hosts where MPS doesn't actually work,
-#              so a SKIP outcome here means *the host* doesn't support
-#              MPS, not that the colocate code is broken.
+#              tee'd to ./colocate-smoke-pytest.log.
+#   5. (run)   Generate ./colocate-smoke-report.txt with everything the
+#              "Reporting back" section of cheap_host_test_plan.md asks
+#              for: host details, exit code, pytest summary, captured
+#              loss values, last 50 lines on failure.
+#   6. (exit)  Best-effort `nvidia-cuda-mps-control quit` so the next
+#              user gets a clean daemon (skip with COLOCATE_KEEP_MPS=1).
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Locations
+# Locations & arg parsing
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -81,6 +90,9 @@ PATCHES_DIR="$REPO_ROOT/patches/sglang/$SGLANG_PATCH_VERSION"
 
 PYTHON="${PYTHON:-python3}"
 PIP="$PYTHON -m pip"
+
+PYTEST_LOG="$REPO_ROOT/colocate-smoke-pytest.log"
+REPORT_PATH="$REPO_ROOT/colocate-smoke-report.txt"
 
 DO_SETUP=1
 DO_RUN=1
@@ -112,7 +124,105 @@ banner() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Setup
+# EXIT trap: tear MPS daemon down so the next renter gets a clean slate.
+# Disabled with COLOCATE_KEEP_MPS=1 (useful when iterating with --skip-setup).
+# ---------------------------------------------------------------------------
+
+cleanup_mps() {
+  if [[ "${COLOCATE_KEEP_MPS:-0}" == "1" ]]; then
+    return
+  fi
+  if command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    echo "quit" | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_mps EXIT
+
+# ---------------------------------------------------------------------------
+# Stale-state cleanup. Idempotent / safe to run repeatedly.
+#  - Stop any Ray cluster left over from a prior run (one of the failure
+#    modes documented in cheap_host_test_plan.md).
+#  - Remove stale /tmp/nvidia-{mps,log} only if no daemon is currently
+#    running (otherwise we'd nuke a healthy daemon's pipe dir).
+# ---------------------------------------------------------------------------
+
+preflight_cleanup() {
+  if command -v ray >/dev/null 2>&1; then
+    ray stop -f >/dev/null 2>&1 || true
+  fi
+  if ! pgrep -f nvidia-cuda-mps-control >/dev/null 2>&1; then
+    rm -rf /tmp/nvidia-mps /tmp/nvidia-log
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight: GPU + MPS. Runs *before* setup so a bad host fails in <60s
+# instead of after 10 minutes of pip install.
+# ---------------------------------------------------------------------------
+
+run_preflight() {
+  banner "Pre-flight: GPU + MPS"
+  preflight_cleanup
+
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "nvidia-smi not found — host has no NVIDIA driver. Aborting." >&2
+    exit 1
+  fi
+  nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
+
+  GPU_COUNT="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')"
+  echo "GPU count: $GPU_COUNT"
+  if [[ "$GPU_COUNT" -lt 1 ]]; then
+    echo "Need at least 1 GPU; found $GPU_COUNT." >&2
+    exit 1
+  fi
+
+  if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    echo "nvidia-cuda-mps-control NOT FOUND — install the CUDA toolkit "  \
+         "(it ships the MPS daemon)." >&2
+    exit 1
+  fi
+  echo "MPS daemon binary: $(command -v nvidia-cuda-mps-control)"
+
+  if [[ "${COLOCATE_SKIP_MPS_PROBE:-0}" == "1" ]]; then
+    echo "Skipping MPS server probe (COLOCATE_SKIP_MPS_PROBE=1)."
+    return
+  fi
+
+  echo
+  echo "Probing whether the MPS daemon can actually spawn a working server"
+  echo "(this is what catches 'no --ipc=host' / sandboxed containers in <30s"
+  echo "instead of letting pytest SKIP after 10 min of setup) …"
+
+  PYTHONPATH="$REPO_ROOT" "$PYTHON" -m tests.colocate._mps_probe || {
+    echo >&2
+    echo "*** MPS pre-flight FAILED. ***" >&2
+    echo >&2
+    echo "  All colocate tests would SKIP on this host. Most likely causes:" >&2
+    echo "    * Container runtime is sandboxing IPC (RunPod Serverless," >&2
+    echo "      Modal sandbox, gVisor-backed managed runtimes)." >&2
+    echo "    * Host kernel / driver doesn't support MPS sharing." >&2
+    echo >&2
+    echo "  Fix options:" >&2
+    echo "    1. Switch to a host/template that exposes --ipc=host" >&2
+    echo "       (Vast.ai 'PyTorch (cuda:12.4)', RunPod 'Interactive Pod'," >&2
+    echo "        Hyperstack, bare-metal Linux). See" >&2
+    echo "        docs/colocate/cheap_host_test_plan.md cost-tier matrix." >&2
+    echo "    2. Set COLOCATE_SKIP_MPS_PROBE=1 to bypass this check and" >&2
+    echo "       let pytest report the SKIPs explicitly (validates the" >&2
+    echo "       skip path, doesn't validate the colocate code path)." >&2
+    if [[ -f /tmp/nvidia-log/server.log ]]; then
+      echo >&2
+      echo "  --- /tmp/nvidia-log/server.log (last 20 lines) ---" >&2
+      tail -n 20 /tmp/nvidia-log/server.log >&2 || true
+      echo "  --- end server.log ---" >&2
+    fi
+    exit 1
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Setup
 # ---------------------------------------------------------------------------
 
 setup_sglang() {
@@ -151,6 +261,117 @@ setup_python() {
   $PIP install -e "$SGLANG_DIR/python[all]"
 }
 
+# ---------------------------------------------------------------------------
+# Test selection
+# ---------------------------------------------------------------------------
+
+pick_test_files() {
+  if [[ -n "$TESTS_OVERRIDE" ]]; then
+    IFS=',' read -ra TEST_FILES <<< "$TESTS_OVERRIDE"
+  elif [[ $RUN_FULL -eq 1 ]]; then
+    # 4×H100-class hosts: run the tiny + every MPS-gated full test. Each
+    # test self-skips if its preconditions aren't met (e.g. has_h100_quad
+    # for the Qwen3-8B tests; mps_works for everything), so this is safe
+    # to run on a 1-GPU host too — the 4-GPU tests just SKIP cleanly.
+    TEST_FILES=(
+      "tests/colocate/test_colocate_tiny.py"
+      "tests/colocate/test_one_step.py"
+      "tests/colocate/test_grad_parity.py"
+      "tests/colocate/test_stability.py"
+      "tests/colocate/test_convergence.py"
+    )
+  else
+    TEST_FILES=(
+      "tests/colocate/test_colocate_tiny.py"
+    )
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Report generator: pulls the "Reporting back" data points out of the
+# captured pytest log so the next agent can paste a single file instead
+# of hand-curating six.
+# ---------------------------------------------------------------------------
+
+write_report() {
+  local pytest_rc="$1"
+  local wall_clock="$2"
+
+  {
+    echo "# Colocate cheap-host smoke report"
+    echo "# Generated:   $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo "# Repo:        $REPO_ROOT"
+    echo "# Branch:      $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    echo "# Commit:      $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "# Test files:  ${TEST_FILES[*]}"
+    echo
+    echo "## Exit code"
+    echo "$pytest_rc"
+    echo
+    echo "## Wall-clock (seconds)"
+    echo "$wall_clock"
+    echo
+    echo "## Host details"
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv 2>/dev/null \
+      || echo "nvidia-smi unavailable"
+    echo "Kernel:    $(uname -srm)"
+    echo "Python:    $($PYTHON --version 2>&1)"
+    echo
+    echo "## pytest summary"
+    if [[ -f "$PYTEST_LOG" ]]; then
+      grep -E "^=+ .*(passed|failed|skipped|error).*=+$" "$PYTEST_LOG" \
+        | tail -n 5 || echo "(no pytest summary line found)"
+    else
+      echo "(pytest log $PYTEST_LOG missing)"
+    fi
+    echo
+    echo "## Captured loss progression"
+    if [[ -f "$PYTEST_LOG" ]]; then
+      grep -E "\[colocate_loop\] step=[0-9]+" "$PYTEST_LOG" \
+        | sed 's/^.*\[colocate_loop\]/[colocate_loop]/' \
+        || echo "(no [colocate_loop] lines — either all tests SKIPPED or output format changed)"
+    fi
+    echo
+    echo "## SKIPPED tests"
+    if [[ -f "$PYTEST_LOG" ]]; then
+      grep -E "^SKIPPED \[" "$PYTEST_LOG" | head -n 20 \
+        || echo "(none — every test was selected for run)"
+    fi
+    echo
+    if [[ "$pytest_rc" -ne 0 ]]; then
+      echo "## Pytest tail (last 60 lines) — FAILURE CASE"
+      if [[ -f "$PYTEST_LOG" ]]; then
+        tail -n 60 "$PYTEST_LOG"
+      fi
+      echo
+      if [[ -f /tmp/nvidia-log/server.log ]]; then
+        echo "## /tmp/nvidia-log/server.log tail (last 50 lines)"
+        tail -n 50 /tmp/nvidia-log/server.log
+      fi
+      if [[ -f /tmp/nvidia-log/control.log ]]; then
+        echo
+        echo "## /tmp/nvidia-log/control.log tail (last 50 lines)"
+        tail -n 50 /tmp/nvidia-log/control.log
+      fi
+    fi
+  } > "$REPORT_PATH"
+
+  echo
+  echo "Report written to: $REPORT_PATH"
+  echo "Pytest log:        $PYTEST_LOG"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+# Pre-flight first, *before* the expensive setup step, so a host without
+# working MPS bails in seconds. With --setup-only we skip the pre-flight
+# entirely (e.g. baking an image on a build host that has no GPU).
+if [[ $DO_RUN -eq 1 ]]; then
+  run_preflight
+fi
+
 if [[ $DO_SETUP -eq 1 ]]; then
   setup_sglang
   setup_python
@@ -163,55 +384,7 @@ if [[ $DO_RUN -eq 0 ]]; then
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# 2. Pre-flight
-# ---------------------------------------------------------------------------
-
-banner "Pre-flight: GPU + MPS"
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "nvidia-smi not found — host has no NVIDIA driver. Aborting." >&2
-  exit 1
-fi
-nvidia-smi --query-gpu=index,name,memory.total --format=csv
-
-GPU_COUNT="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')"
-echo "GPU count: $GPU_COUNT"
-if [[ "$GPU_COUNT" -lt 1 ]]; then
-  echo "Need at least 1 GPU; found $GPU_COUNT." >&2
-  exit 1
-fi
-
-if ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
-  echo "nvidia-cuda-mps-control NOT FOUND — install the CUDA toolkit "  \
-       "(it ships the MPS daemon)." >&2
-  exit 1
-fi
-echo "MPS daemon binary: $(command -v nvidia-cuda-mps-control)"
-
-# ---------------------------------------------------------------------------
-# 3. Run
-# ---------------------------------------------------------------------------
-
-# Pick which test files to run.
-if [[ -n "$TESTS_OVERRIDE" ]]; then
-  IFS=',' read -ra TEST_FILES <<< "$TESTS_OVERRIDE"
-elif [[ $RUN_FULL -eq 1 ]]; then
-  # 4×H100-class hosts: run the tiny + every MPS-gated full test. Each
-  # test self-skips if its preconditions aren't met (e.g. has_h100_quad
-  # for the Qwen3-8B tests; mps_works for everything), so this is safe
-  # to run on a 1-GPU host too — the 4-GPU tests just SKIP cleanly.
-  TEST_FILES=(
-    "tests/colocate/test_colocate_tiny.py"
-    "tests/colocate/test_one_step.py"
-    "tests/colocate/test_grad_parity.py"
-    "tests/colocate/test_stability.py"
-    "tests/colocate/test_convergence.py"
-  )
-else
-  TEST_FILES=(
-    "tests/colocate/test_colocate_tiny.py"
-  )
-fi
+pick_test_files
 
 banner "pytest: ${TEST_FILES[*]}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -229,8 +402,18 @@ fi
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 cd "$REPO_ROOT"
+START_TS=$(date +%s)
 PYTEST_RC=0
-$PYTHON -m pytest -xvs "${TEST_FILES[@]}" || PYTEST_RC=$?
+# tee'd so write_report can grep loss values + summary + SKIP reasons.
+# PIPESTATUS captures pytest's exit (bash-only; shebang is bash).
+set +e
+$PYTHON -m pytest -xvs "${TEST_FILES[@]}" 2>&1 | tee "$PYTEST_LOG"
+PYTEST_RC=${PIPESTATUS[0]}
+set -e
+END_TS=$(date +%s)
+WALL_CLOCK=$((END_TS - START_TS))
 
-banner "Smoke run complete (pytest exit=$PYTEST_RC)."
+write_report "$PYTEST_RC" "$WALL_CLOCK"
+
+banner "Smoke run complete (pytest exit=$PYTEST_RC, wall=${WALL_CLOCK}s)."
 exit "$PYTEST_RC"

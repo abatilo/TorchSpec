@@ -93,7 +93,19 @@ The runner script aborts with exit code 1 if any of these are missing:
 4. Outbound HTTPS to `github.com` and `huggingface.co` (for sglang
    clone + Qwen3-0.6B-Base download — model is **not gated**).
 
-**Quick MPS sanity check** (run on the host before committing time):
+**Quick MPS sanity check** (run on the host before committing time). The
+runner does this automatically in pre-flight, but it's also useful as a
+standalone 30-second smoke test from a fresh checkout:
+
+```bash
+PYTHONPATH=. python -m tests.colocate._mps_probe
+# Prints e.g.   mps_works: True  — ok
+# Or            mps_works: False — cuInit/cuDeviceGetCount returned rc=805 (operation not supported)
+# Exit 0 if MPS works on this host; 1 if it doesn't.
+```
+
+If you don't have torchspec checked out yet and just want to test the
+MPS plumbing manually:
 
 ```bash
 nvidia-cuda-mps-control -d                 # start daemon
@@ -199,11 +211,29 @@ they don't run, pass `-m slow` via `--tests=...` or set
 `PHASE6_STABILITY_STEPS` / `PHASE7_CONVERGE_STEPS` to non-default
 values.)
 
-### Skipped is also OK
+### Pre-flight MPS probe failure (exit 1)
 
-If `mps_works()` returns False on the host, every MPS-gated test
-SKIPS in <2 s with a clear reason. **Skip ≠ fail.** Exit code is
-still `0`. You'll see:
+As of commit `0a1e153`+ the runner probes MPS *before* the expensive
+setup step. On a host where the MPS daemon starts but the server can't
+spawn a CUDA context (the most common cheap-host failure), pre-flight
+fails in ~30 s with:
+
+```
+*** MPS pre-flight FAILED. ***
+
+  All colocate tests would SKIP on this host. Most likely causes:
+    * Container runtime is sandboxing IPC ...
+    * Host kernel / driver doesn't support MPS sharing.
+```
+
+…and exit code `1`. **This is by design** — it saves you the 5–10
+minutes of `pip install` that would otherwise precede an all-SKIP
+pytest run. Switch host/template and re-run.
+
+If you specifically want to validate the SKIP path (e.g. you're
+verifying on Modal sandbox that the skip gate fires), set
+`COLOCATE_SKIP_MPS_PROBE=1` to bypass the pre-flight gate. You'll then
+see:
 
 ```
 SKIPPED [1] tests/colocate/test_colocate_tiny.py:64: Tiny colocate
@@ -211,8 +241,7 @@ smoke needs working NVIDIA MPS. On hosts where the MPS server reports
 'operation not supported' ...
 ```
 
-If you see this, the host is the problem (no `--ipc=host` or no MPS
-support). Try a different rental tier.
+…and exit code `0` (skip ≠ fail).
 
 ---
 
@@ -224,8 +253,8 @@ support). Try a different rental tier.
 | `nvidia-cuda-mps-control: command not found` | CUDA toolkit not installed | `apt-get install cuda-toolkit-12-4` or use a `nvidia/cuda:*-devel-*` image. |
 | Pre-flight: `Need at least 1 GPU; found 0` | GPU not visible to the container | Re-launch with `--gpus all` (Docker) or pick a template with GPU passthrough enabled. |
 | Test SKIP with `'operation not supported'` in MPS server log | No `--ipc=host` (gVisor / Modal-style sandbox) | Switch host or pick the "Interactive" template. |
-| Test FAILS with `MPS daemon did not produce ... within 10s` | Stale state from a previous run | `rm -rf /tmp/nvidia-mps /tmp/nvidia-log` and re-run. |
-| Test FAILS with `socketPollConnect ... Connection refused` | Stale Ray cluster | `ray stop -f` (the runner doesn't currently auto-clean Ray; manual stop fixes it). |
+| Test FAILS with `MPS daemon did not produce ... within 10s` | Stale state from a previous run | The runner's pre-flight now does `rm -rf /tmp/nvidia-mps /tmp/nvidia-log` automatically when no daemon is running. If this still fires, the daemon *is* running but is wedged — `echo quit \| nvidia-cuda-mps-control` then re-run. |
+| Test FAILS with `socketPollConnect ... Connection refused` | Stale Ray cluster | The runner's pre-flight now runs `ray stop -f` automatically. If you still see this, a non-`ray`-managed actor is bound to the port — `pkill -f raylet` is the bigger hammer. |
 | Test HANGS at `init_union_world` | sglang colocate.patch wasn't applied | Re-run with `--skip-setup` removed; the script's setup phase re-clones + re-patches sglang. |
 | Test FAILS with `OutOfMemoryError` on the **tiny** config | GPU smaller than 24 GB | The tiny config needs at least 24 GB VRAM. Try a bigger GPU. |
 | Test FAILS with `OutOfMemoryError` on the **full** config | Trying to run Qwen3-8B on <80 GB GPU | Stop trying to run `--full` on non-H100 / non-A100-80 hardware. |
@@ -246,19 +275,24 @@ on any timeout.
 
 ## Reporting back
 
-Once you've run on a host, the things to report back are:
+The runner writes a pre-baked report at `colocate-smoke-report.txt`
+inside the repo root when pytest exits. Paste that file in your
+report-back — it contains everything below already filled in:
 
 1. **Host details**: cloud + GPU model + count + memory + driver
-   version (`nvidia-smi --query-gpu=name,memory.total,driver_version
-   --format=csv`).
+   version (auto-captured from `nvidia-smi`).
 2. **Exit code** of `run_smoke_host.sh`.
 3. **pytest summary line** (e.g. `2 passed in 712.34s`).
 4. For each test that PASSED: the captured `loss=<float>` values from
-   the `[colocate_loop]` lines (so we can sanity-check whether
-   training is making sane progress).
-5. For each test that FAILED: the last ~50 lines of stdout/stderr
-   plus the contents of `/tmp/nvidia-log/server.log`.
-6. Total wall-clock time and approximate cost.
+   the `[colocate_loop]` lines (auto-grepped from the pytest log so
+   we can sanity-check whether training is making sane progress).
+5. For each test that FAILED: the last ~60 lines of pytest output
+   plus the tail of `/tmp/nvidia-log/server.log` and `control.log`.
+6. Total wall-clock seconds (you'll have to back-of-envelope the cost
+   from the host's $/hr — the script doesn't know what tier you rented).
+
+The full pytest output is also kept at `colocate-smoke-pytest.log`
+in case the report's grep heuristics miss something interesting.
 
 If exit code is non-zero **and** the failure isn't covered in the
 table above, file a comment on the colocate-training-inference branch
@@ -319,7 +353,8 @@ Then stop the Pod / instance from the cloud console. **Don't forget**
 - `tests/colocate/_mps_probe.py` — `has_n_gpus(n)` + `mps_works()`
   shared skip helpers
 - `scripts/colocate/run_smoke_host.sh` — the runner (this doc's main
-  artifact)
+  artifact). Writes `colocate-smoke-report.txt` +
+  `colocate-smoke-pytest.log` at repo root on exit.
 - `scripts/modal/modal_colocate_smoke.py::phase_tiny` — same tiny
   test, runnable on Modal as a SKIP sanity check
 - `patches/sglang/v0.5.8.post1/colocate.patch` — the upstream sglang

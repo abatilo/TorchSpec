@@ -1034,3 +1034,46 @@ in its `_fake_run` callback to satisfy the new pipe-poll loop in
 `test_setup_for_colocate_falls_back_when_probe_fails` pins down the
 graceful-degradation behaviour we depend on for the Modal-sandbox
 SKIPs to work.
+
+### Runner hardening (2026-05-13)
+
+Follow-up after the cheap-host plan landed: the runner script picked
+up four small fail-fast / report-back improvements based on a fresh
+audit of how the next agent would actually use it on a paid host.
+
+1. **Pre-flight before setup.** Pre-flight (nvidia-smi, GPU count, MPS
+   probe) used to run *after* the 5–10 minute `pip install` step.
+   That meant a host without working MPS burned $0.05–$1.00 of compute
+   before producing a SKIP. Pre-flight now runs first so a bad host
+   exits in ~30 s.
+2. **Real MPS server probe in pre-flight.** Instead of just checking
+   the `nvidia-cuda-mps-control` binary is on PATH, the runner now
+   invokes `python -m tests.colocate._mps_probe`, which does the same
+   `cuInit` / `cuDeviceGetCount` round-trip the pytest skip gate
+   does — but with a verbose reason string (extracted from the new
+   `mps_works_verbose()` helper) and an exit-1 + diagnostic message
+   on failure. The escape hatch `COLOCATE_SKIP_MPS_PROBE=1` reverts
+   to the old "let pytest produce a clean SKIP" behaviour for users
+   who want to validate the skip path itself.
+3. **Auto-cleanup of stale Ray + MPS state.** The plan's failure-modes
+   table previously documented two manual `ray stop -f` /
+   `rm -rf /tmp/nvidia-{mps,log}` recipes. Pre-flight now does both
+   automatically (the rm only fires when no daemon is currently
+   running, so it never nukes a healthy daemon's pipe dir).
+4. **Auto-generated report.** Pytest output is `tee`'d to
+   `colocate-smoke-pytest.log`, and a structured
+   `colocate-smoke-report.txt` is written at exit with everything the
+   plan's "Reporting back" section asks for — host details, exit
+   code, pytest summary line, `[colocate_loop] step=N loss=…` lines,
+   skipped tests, and on failure the last 60 lines of pytest output
+   plus tails of `/tmp/nvidia-log/{server,control}.log`. The next
+   agent can paste the report file verbatim instead of hand-curating
+   six data points from a 1000-line pytest log.
+
+Also: bash `EXIT` trap now best-effort-sends `quit` to the MPS daemon
+on script exit (skippable with `COLOCATE_KEEP_MPS=1`), so the daemon
+no longer leaks when the script returns normally.
+
+None of these touched the colocate code path itself — pure runner +
+report-back hardening so the next agent gets actionable signal
+faster.
