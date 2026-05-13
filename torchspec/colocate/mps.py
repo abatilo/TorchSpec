@@ -257,12 +257,77 @@ def stop_mps_daemon(handle: Optional[MpsHandle] = None) -> bool:
         return False
 
 
+def _probe_mps_server_works(
+    pipe_dir: str, log_dir: str, *, timeout_s: float = 5.0
+) -> tuple[bool, str]:
+    """Force the MPS daemon to spawn a server and report whether it succeeded.
+
+    The daemon launches the per-GPU server process *lazily* on the first
+    client connect, so a healthy ``-d`` start tells us nothing about
+    whether the server can actually create a CUDA context. On
+    container hosts (Modal sandbox H100s, in particular) the daemon
+    starts cleanly but the server fails immediately with
+    ``Failed to start : operation not supported``, leaving every
+    real CUDA client to crash with ``Error 805``.
+
+    To avoid that nightmare we eagerly trigger a server spawn here:
+    the simplest way is to send the daemon a ``get_server_list``
+    command (which forces a ping into the per-GPU server) and watch
+    its server log for either the success line or the
+    ``operation not supported`` failure. We treat a clean log (no
+    failure within the timeout) as success.
+
+    Returns ``(ok, reason)`` so the caller can log a useful message.
+    """
+    server_log = os.path.join(log_dir, "server.log")
+    log_size_before = os.path.getsize(server_log) if os.path.exists(server_log) else 0
+
+    env = {**os.environ, **mps_client_env(pipe_dir=pipe_dir, log_dir=log_dir)}
+    try:
+        subprocess.run(
+            [_MPS_CONTROL_BIN],
+            input=b"get_server_list\n",
+            env=env,
+            timeout=5,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"failed to issue get_server_list: {e}"
+
+    import time as _time
+
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        if os.path.exists(server_log):
+            with open(server_log, "rb") as f:
+                f.seek(log_size_before)
+                new_bytes = f.read()
+            if b"operation not supported" in new_bytes:
+                # H100 MPS isn't supported in containers without
+                # specific privileges. Surface this fact loudly.
+                return False, (
+                    "MPS server reported 'operation not supported' on first "
+                    "spawn. Common cause: container lacks the privileges MPS "
+                    "needs (it generally requires --ipc=host or equivalent "
+                    "shared-mem and capabilities). The colocate path will "
+                    "fall back to fractional GPU sharing without MPS — "
+                    "trainer + engine still share the GPU, but their CUDA "
+                    "kernels serialise instead of overlapping."
+                )
+        _time.sleep(0.2)
+    # No failure logged in the window → assume success.
+    return True, "ok"
+
+
 def setup_for_colocate(
     pipe_dir: str = DEFAULT_PIPE_DIR,
     log_dir: str = DEFAULT_LOG_DIR,
     *,
     register_atexit: bool = True,
-) -> tuple[MpsHandle, dict[str, str]]:
+    probe_server: bool = True,
+) -> tuple[Optional[MpsHandle], dict[str, str]]:
     """One-shot: start daemon (if needed), return handle + client env.
 
     Convenience entry point for the Ray driver — mirrors the
@@ -275,8 +340,39 @@ def setup_for_colocate(
     daemon process. SIGKILL / OOM-kills bypass ``atexit`` of course;
     that's by design — the next driver run's ``start_mps_daemon`` is
     idempotent and will reuse a still-running daemon.
+
+    When ``probe_server`` (default) is true we eagerly spawn an MPS
+    server to detect environments where the daemon comes up but the
+    server can't create a CUDA context (Modal sandbox H100s, some
+    Docker hosts without --ipc=host). On detection we tear the
+    daemon back down and return ``(None, {})``: the caller still gets
+    a working colocate path (fractional GPU claim, no MPS env) — the
+    only loss is concurrent trainer/engine kernel execution.
+
+    Set ``TORCHSPEC_DISABLE_MPS=1`` to skip MPS bring-up entirely
+    (useful for local / CI environments where MPS is known broken).
     """
+    if os.environ.get("TORCHSPEC_DISABLE_MPS", "") in ("1", "true", "True"):
+        logger.info(
+            "TORCHSPEC_DISABLE_MPS set; skipping MPS daemon. Trainer "
+            "and engine will share each GPU but kernels will serialise."
+        )
+        return None, {}
+
     handle = start_mps_daemon(pipe_dir=pipe_dir, log_dir=log_dir)
+
+    if probe_server:
+        ok, reason = _probe_mps_server_works(pipe_dir=pipe_dir, log_dir=log_dir)
+        if not ok:
+            logger.warning("MPS server probe failed: %s", reason)
+            # Best-effort tear down so a future driver run doesn't
+            # find a stale (broken) daemon and skip restart.
+            try:
+                stop_mps_daemon(handle)
+            except Exception:
+                logger.exception("Failed to stop broken MPS daemon")
+            return None, {}
+
     if register_atexit and handle.started_by_us:
         import atexit
 

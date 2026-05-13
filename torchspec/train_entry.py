@@ -314,11 +314,24 @@ def train_async_no_generation(args):
         from torchspec.colocate.mps import setup_for_colocate as _early_setup_mps
 
         _mps_handle, _mps_env = _early_setup_mps()
-        os.environ.update(_mps_env)
-        logger.info(
-            "MPS daemon ready (pre-Ray start, started_by_us=%s, pipe_dir=%s)",
-            _mps_handle.started_by_us, _mps_handle.pipe_dir,
-        )
+        if _mps_handle is None:
+            # MPS is unavailable in this environment (e.g. Modal sandbox
+            # without --ipc=host). Continue with fractional GPU sharing
+            # but no MPS — see setup_for_colocate docstring for the
+            # tradeoff. Mark the args so downstream code knows not to
+            # inject CUDA_MPS_PIPE_DIRECTORY into actor runtime_envs.
+            args.colocate_mps_unavailable = True
+            logger.warning(
+                "MPS unavailable on this host; running colocate without "
+                "kernel concurrency (fractional GPU sharing only)."
+            )
+        else:
+            args.colocate_mps_unavailable = False
+            os.environ.update(_mps_env)
+            logger.info(
+                "MPS daemon ready (pre-Ray start, started_by_us=%s, pipe_dir=%s)",
+                _mps_handle.started_by_us, _mps_handle.pipe_dir,
+            )
 
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
@@ -332,7 +345,7 @@ def train_async_no_generation(args):
         # `torch.cuda.is_available()` inside the controller (e.g.
         # via tokenizer/dataset code that does `torch.cuda.*`)
         # crashes the whole run.
-        if is_mps_colocate(args):
+        if is_mps_colocate(args) and not getattr(args, "colocate_mps_unavailable", False):
             from torchspec.colocate.mps import mps_client_env as _mps_env_fn
 
             controller_env.update(_mps_env_fn())

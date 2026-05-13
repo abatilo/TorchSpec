@@ -106,7 +106,8 @@ class RayTrainGroup:
         # expandable_segments so two cohabiting CUDA contexts can grow
         # without thrashing the segment table.
         if is_mps_colocate(self.args):
-            env_vars.update(mps_client_env())
+            if not getattr(self.args, "colocate_mps_unavailable", False):
+                env_vars.update(mps_client_env())
             env_vars.setdefault(
                 "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
             )

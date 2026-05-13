@@ -223,10 +223,11 @@ def _prepare_sgl_engines(
         sgl_num_cpus = sgl_num_gpus
         env_vars = {
             **env_vars,
-            **mps_client_env(),
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
             "PYTORCH_ALLOC_CONF": "expandable_segments:True",
         }
+        if not getattr(args, "colocate_mps_unavailable", False):
+            env_vars.update(mps_client_env())
     else:
         sgl_num_gpus = 0.2
         sgl_num_cpus = 0.2
