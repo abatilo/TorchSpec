@@ -320,16 +320,50 @@ class Trainer(abc.ABC):
         per_dp_rank_batch_size: int = 1,
     ) -> None:
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
+        gpu_device = torch.cuda.current_device()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
+
+        if self._is_colocate_nccl():
+            if mooncake_config is not None:
+                logger.warning(
+                    "[Rank %s] set_eval_queue received mooncake_config but "
+                    "transfer_mode=nccl is active; ignoring it.",
+                    self.dp_rank,
+                )
+            nccl_fetcher = self._build_nccl_fetcher(torch.device("cuda", gpu_device))
+            self._eval_data_fetcher = ColocateDataFetcher(
+                queue=queue,
+                nccl_fetcher=nccl_fetcher,
+                collator=collator,
+                device=gpu_device,
+                batch_size=per_dp_rank_batch_size,
+                assistant_header_ids=self.assistant_header_ids,
+                end_token_ids=self.end_token_ids,
+                dynamic_loss_mask=self.dynamic_loss_mask,
+                last_turn_loss_only=self.last_turn_loss_only,
+                skip_after_header=self.skip_after_header,
+                min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
+                ttt_length=getattr(self.args, "ttt_length", 1),
+                max_seq_length=getattr(self.args, "max_seq_length", None),
+            )
+            self._eval_collator = collator
+            self._eval_cache: list[dict] = []
+            logger.info(
+                "[Rank %s] Colocate (NCCL) eval data fetcher initialised "
+                "(batch_size=%s, paired_engine_rank=%s)",
+                self.dp_rank, per_dp_rank_batch_size,
+                self._union_world.paired_global_rank,
+            )
+            return
+
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
-
-        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         self._eval_data_fetcher = MooncakeDataFetcher(
             queue=queue,
             mooncake_store=self.mooncake_store,
             collator=collator,
-            device=torch.cuda.current_device(),
+            device=gpu_device,
             batch_size=per_dp_rank_batch_size,
             assistant_header_ids=self.assistant_header_ids,
             end_token_ids=self.end_token_ids,
@@ -500,6 +534,15 @@ class Trainer(abc.ABC):
                 if "_opt_events" in m:
                     opt_ms += m["_opt_events"][0].elapsed_time(m["_opt_events"][1])
             metrics["perf/optimizer_time"] = opt_ms / 1000.0
+
+        # Phase 6: peak GPU allocation since the previous step. Useful
+        # in colocate runs where engine + trainer share one pool — slow
+        # leaks on either side surface here as monotonic growth.
+        # Reset every step so the metric reflects the most recent
+        # window; the stability test windows over 100-step intervals.
+        peak = self.prof.peak_alloc_metrics(reset=True)
+        for k, v in peak.items():
+            metrics[f"perf/{k}"] = v
 
         return metrics
 

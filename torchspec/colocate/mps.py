@@ -230,13 +230,27 @@ def stop_mps_daemon(handle: Optional[MpsHandle] = None) -> bool:
 
 
 def setup_for_colocate(
-    pipe_dir: str = DEFAULT_PIPE_DIR, log_dir: str = DEFAULT_LOG_DIR
+    pipe_dir: str = DEFAULT_PIPE_DIR,
+    log_dir: str = DEFAULT_LOG_DIR,
+    *,
+    register_atexit: bool = True,
 ) -> tuple[MpsHandle, dict[str, str]]:
     """One-shot: start daemon (if needed), return handle + client env.
 
     Convenience entry point for the Ray driver — mirrors the
     ``setup_for_colocate(...)`` signature the placement-group code will
     import in the next sub-task of Phase 1.
+
+    Phase 6 hygiene: when ``register_atexit`` is true (default) and we
+    actually started the daemon, register an ``atexit`` hook to
+    ``stop_mps_daemon`` so a clean driver shutdown doesn't leak the
+    daemon process. SIGKILL / OOM-kills bypass ``atexit`` of course;
+    that's by design — the next driver run's ``start_mps_daemon`` is
+    idempotent and will reuse a still-running daemon.
     """
     handle = start_mps_daemon(pipe_dir=pipe_dir, log_dir=log_dir)
+    if register_atexit and handle.started_by_us:
+        import atexit
+
+        atexit.register(stop_mps_daemon, handle)
     return handle, mps_client_env(pipe_dir=pipe_dir, log_dir=log_dir)

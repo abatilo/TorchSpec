@@ -48,6 +48,7 @@ from torchspec.controller import (
     build_mooncake_config,
     run_training_loop,
     setup_async_training_with_engines,
+    setup_colocate_training_with_engines,
 )
 from torchspec.inference.factory import prepare_inference_engines
 from torchspec.ray.placement_group import (
@@ -332,9 +333,10 @@ def train_async_no_generation(args):
                 handle.pipe_dir,
             )
         pgs = create_placement_groups(args)
-        # Skip mooncake master under MPS colocate — Phase 5 will rip it out
-        # entirely; for now we just don't bother starting it because it
-        # wouldn't be used.
+        # Phase 5: in colocate (NCCL transfer) mode the entire Mooncake
+        # plumbing is unused. Skip both the master daemon and the
+        # config build. Downstream code (Trainer / SglEngine) treats
+        # `mooncake_config=None` as "not on the Mooncake path".
         if is_mps_colocate(args):
             mooncake_config = None
         else:
@@ -389,11 +391,32 @@ def train_async_no_generation(args):
         # dispatched after to maximize parallelism with the wait below.
         _maybe_create_scratch_draft(args, train_group)
 
+        # Phase 6 init-order fence (colocate only): wait for trainer
+        # actors to finish initialising before we kick off engine init.
+        # Under MPS, the trainer + engine share one memory pool; if
+        # both come up in parallel, sglang's mem_fraction_static
+        # accounting can race against FSDP's allocator and either side
+        # may OOM the other. Sequencing trainer-first guarantees the
+        # trainer has claimed its `train_frac` chunk before sglang
+        # tries to allocate KV cache. The disaggregated path keeps the
+        # original parallel init for cold-start latency.
+        if is_mps_colocate(args):
+            logger.info(
+                "[colocate] Waiting for %d trainer actors to finish init "
+                "before starting %d engines (memory-sharing fence).",
+                len(train_init_refs),
+                getattr(args, "inference_num_gpus", 0),
+            )
+            ray.get(train_init_refs)
+            train_init_refs = []  # already collected; don't double-await below
+
         inference_engines, engine_init_refs = prepare_inference_engines(
             args, pgs["inference"], mooncake_config
         )
 
-    # [8] Wait for all actor init to complete concurrently
+    # [8] Wait for all actor init to complete concurrently. (In
+    # colocate mode train_init_refs is empty — already awaited at the
+    # init-order fence above; we still wait on engine refs here.)
     n_train = len(train_init_refs)
     logger.info(
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
@@ -401,8 +424,9 @@ def train_async_no_generation(args):
     )
     all_results = timer.wait("Actor initialization", train_init_refs + engine_init_refs)
 
-    train_results = all_results[:n_train]
-    assert len(set(train_results)) == 1
+    if n_train > 0:
+        train_results = all_results[:n_train]
+        assert len(set(train_results)) == 1
     logger.info(
         f"All {n_train} training actors and {len(engine_init_refs)} inference engines initialized"
     )
@@ -411,13 +435,37 @@ def train_async_no_generation(args):
         train_group.set_vocab_buffers(*vocab_mapping)
         logger.info("Loaded vocab mapping into training actors")
 
-    # [9] Setup async training with pre-created controller
-    with timer.phase("Setup async training"):
-        controller, inference_manager = setup_async_training_with_engines(
-            args, train_group, mooncake_config, inference_engines, controller=controller
-        )
+    # [9] Setup training with pre-created controller. Colocate (NCCL)
+    # mode skips the AsyncInferenceManager entirely — see
+    # setup_colocate_training_with_engines for what's left out.
+    with timer.phase("Setup training"):
+        if is_mps_colocate(args):
+            controller, inference_manager = setup_colocate_training_with_engines(
+                args, train_group, inference_engines, controller=controller
+            )
+        else:
+            controller, inference_manager = setup_async_training_with_engines(
+                args, train_group, mooncake_config, inference_engines, controller=controller
+            )
 
     timer.log_summary()
+
+    if is_mps_colocate(args):
+        # The synchronous colocate training loop is not yet implemented
+        # in this repo: it requires the upstream sglang patch (see
+        # docs/colocate/sglang_patch.md) before the engine→trainer P2P
+        # data plane is end-to-end. Once that lands, this branch should
+        # call run_colocate_training_loop(args, controller, train_group,
+        # inference_engines, ...). The pre-loop wiring (controller actor,
+        # train_group, inference_engines, train queues) is fully set up
+        # at this point, so the loop is the only remaining gap.
+        raise NotImplementedError(
+            "Colocate (transfer_mode='nccl') training requires the upstream "
+            "sglang patch (see docs/colocate/sglang_patch.md) plus the "
+            "synchronous run_colocate_training_loop, which is the Phase 5 "
+            "follow-up. To run inference-only or the multi-tensor smoke "
+            "test, see scripts/modal/modal_colocate_smoke.py::phase4_multi_tensor."
+        )
 
     # [10] Run training loop (no ray.put needed — dataset lives on controller)
     run_training_loop(
