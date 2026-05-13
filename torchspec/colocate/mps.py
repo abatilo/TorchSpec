@@ -258,7 +258,7 @@ def stop_mps_daemon(handle: Optional[MpsHandle] = None) -> bool:
 
 
 def _probe_mps_server_works(
-    pipe_dir: str, log_dir: str, *, timeout_s: float = 5.0
+    pipe_dir: str, log_dir: str, *, timeout_s: float = 30.0
 ) -> tuple[bool, str]:
     """Force the MPS daemon to spawn a server and report whether it succeeded.
 
@@ -270,55 +270,59 @@ def _probe_mps_server_works(
     ``Failed to start : operation not supported``, leaving every
     real CUDA client to crash with ``Error 805``.
 
-    To avoid that nightmare we eagerly trigger a server spawn here:
-    the simplest way is to send the daemon a ``get_server_list``
-    command (which forces a ping into the per-GPU server) and watch
-    its server log for either the success line or the
-    ``operation not supported`` failure. We treat a clean log (no
-    failure within the timeout) as success.
+    The most reliable probe is to spawn a tiny CUDA client (a
+    subprocess that imports torch and does ``torch.cuda.device_count()``)
+    with the MPS env vars set: if it succeeds, MPS works; if it
+    raises with error 805 (or its CUDA equivalent), MPS is broken
+    and we should fall back. We do this in an isolated subprocess
+    so the *driver's* CUDA state isn't polluted by a failed init.
 
     Returns ``(ok, reason)`` so the caller can log a useful message.
     """
-    server_log = os.path.join(log_dir, "server.log")
-    log_size_before = os.path.getsize(server_log) if os.path.exists(server_log) else 0
-
     env = {**os.environ, **mps_client_env(pipe_dir=pipe_dir, log_dir=log_dir)}
+
+    probe_code = (
+        "import os, sys, ctypes\n"
+        "try:\n"
+        "    cuda = ctypes.CDLL('libcuda.so.1')\n"
+        "    rc = cuda.cuInit(0)\n"
+        "    if rc != 0:\n"
+        "        sys.exit(rc)\n"
+        "    cnt = ctypes.c_int(0)\n"
+        "    rc = cuda.cuDeviceGetCount(ctypes.byref(cnt))\n"
+        "    sys.exit(rc)\n"
+        "except OSError as e:\n"
+        "    sys.stderr.write(str(e))\n"
+        "    sys.exit(255)\n"
+    )
     try:
-        subprocess.run(
-            [_MPS_CONTROL_BIN],
-            input=b"get_server_list\n",
-            env=env,
-            timeout=5,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        proc = subprocess.run(
+            ["python3", "-c", probe_code],
+            env=env, timeout=timeout_s,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, f"failed to issue get_server_list: {e}"
+    except subprocess.TimeoutExpired as e:
+        return False, f"MPS probe timed out after {timeout_s}s: {e}"
 
-    import time as _time
+    if proc.returncode == 0:
+        return True, "ok"
 
-    deadline = _time.time() + timeout_s
-    while _time.time() < deadline:
-        if os.path.exists(server_log):
-            with open(server_log, "rb") as f:
-                f.seek(log_size_before)
-                new_bytes = f.read()
-            if b"operation not supported" in new_bytes:
-                # H100 MPS isn't supported in containers without
-                # specific privileges. Surface this fact loudly.
-                return False, (
-                    "MPS server reported 'operation not supported' on first "
-                    "spawn. Common cause: container lacks the privileges MPS "
-                    "needs (it generally requires --ipc=host or equivalent "
-                    "shared-mem and capabilities). The colocate path will "
-                    "fall back to fractional GPU sharing without MPS — "
-                    "trainer + engine still share the GPU, but their CUDA "
-                    "kernels serialise instead of overlapping."
-                )
-        _time.sleep(0.2)
-    # No failure logged in the window → assume success.
-    return True, "ok"
+    # Check the server log too — the daemon writes its own diagnostic
+    # there which is much more readable than the bare cuInit return
+    # code.
+    server_log = os.path.join(log_dir, "server.log")
+    detail = ""
+    if os.path.exists(server_log):
+        with open(server_log, "rb") as f:
+            tail = f.read()[-2048:].decode("utf-8", errors="replace")
+        if "operation not supported" in tail:
+            detail = " (MPS server reported 'operation not supported' — common in containers without --ipc=host)"
+        elif tail.strip():
+            detail = f" (server.log tail: {tail.strip().splitlines()[-1]!r})"
+    return False, (
+        f"MPS probe failed with cuInit/cuDeviceGetCount rc={proc.returncode}"
+        f"{detail}. Falling back to fractional GPU sharing without MPS."
+    )
 
 
 def setup_for_colocate(
