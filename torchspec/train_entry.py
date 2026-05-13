@@ -38,6 +38,8 @@ from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from torchspec import AutoDraftModelConfig
+from torchspec.colocate import is_mps_colocate, validate_colocate_config
+from torchspec.colocate.mps import setup_for_colocate
 from torchspec.config.train_config import config_to_flat_args, load_config
 from torchspec.config.utils import generate_draft_model_config
 from torchspec.controller import (
@@ -148,6 +150,7 @@ def parse_config():
 
     _resolve_batch_size(flat_args)
     _validate_usp_args(flat_args)
+    validate_colocate_config(flat_args)
 
     return flat_args
 
@@ -317,9 +320,26 @@ def train_async_no_generation(args):
 
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
+        # MPS colocate (Phase 1): start the per-node MPS control daemon
+        # *before* placement groups so the actors that come up immediately
+        # have a daemon to register with. Idempotent: safe if Ray already
+        # started one on this node.
+        if is_mps_colocate(args):
+            handle, _env = setup_for_colocate()
+            logger.info(
+                "MPS daemon ready (started_by_us=%s, pipe_dir=%s)",
+                handle.started_by_us,
+                handle.pipe_dir,
+            )
         pgs = create_placement_groups(args)
-        launch_mooncake_master(args)
-        mooncake_config = build_mooncake_config(args)
+        # Skip mooncake master under MPS colocate — Phase 5 will rip it out
+        # entirely; for now we just don't bother starting it because it
+        # wouldn't be used.
+        if is_mps_colocate(args):
+            mooncake_config = None
+        else:
+            launch_mooncake_master(args)
+            mooncake_config = build_mooncake_config(args)
 
     # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
     dataset_size, eval_dataset_size = timer.wait(

@@ -195,8 +195,22 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
 
-        # Get configuration
-        mem_fraction = getattr(self.args, "sglang_mem_fraction_static", 0.8)
+        # Get configuration. Under MPS colocate, infer_frac is the canonical
+        # GPU-share budget; sglang's mem_fraction_static must agree, otherwise
+        # sglang will size its KV cache assuming the whole GPU is free and
+        # OOM the trainer. We override regardless of what was passed via
+        # sglang.mem_fraction_static so users don't have to keep two values
+        # in sync. See docs/colocate/implementation.md §Phase 1.
+        if getattr(self.args, "colocate_strategy", None) == "mps":
+            infer_frac = getattr(self.args, "infer_frac", None)
+            if infer_frac is None:
+                raise ValueError(
+                    "colocate_strategy='mps' requires training.infer_frac to be set "
+                    "so sglang's mem_fraction_static can match the Ray-level GPU claim."
+                )
+            mem_fraction = float(infer_frac)
+        else:
+            mem_fraction = getattr(self.args, "sglang_mem_fraction_static", 0.8)
         pp_size = getattr(self.args, "sglang_pp_size", 1)
         if self.args.aux_hidden_states_layers is not None:
             self.aux_hidden_state_layer_ids = self.args.aux_hidden_states_layers

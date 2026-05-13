@@ -26,6 +26,8 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from torchspec.colocate import is_mps_colocate
+from torchspec.colocate.mps import mps_client_env
 from torchspec.utils.distributed import _build_usp_group_ranks
 from torchspec.utils.env import get_torchspec_env_vars
 
@@ -98,6 +100,19 @@ class RayTrainGroup:
             "TORCHINDUCTOR_FX_GRAPH_CACHE",
             os.environ.get("TORCHINDUCTOR_FX_GRAPH_CACHE", "1"),
         )
+
+        # MPS colocate: every trainer process must talk to the same MPS
+        # control daemon as its paired engine, and the allocator must use
+        # expandable_segments so two cohabiting CUDA contexts can grow
+        # without thrashing the segment table.
+        if is_mps_colocate(self.args):
+            env_vars.update(mps_client_env())
+            env_vars.setdefault(
+                "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+            )
+            env_vars.setdefault(
+                "PYTORCH_ALLOC_CONF", "expandable_segments:True"
+            )
 
         TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(
             self._training_class

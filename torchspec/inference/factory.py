@@ -23,6 +23,8 @@
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from torchspec.colocate import is_mps_colocate
+from torchspec.colocate.mps import mps_client_env
 from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
@@ -193,6 +195,23 @@ def _prepare_sgl_engines(
     SglRayActor = ray.remote(SglEngine)
     env_vars = get_torchspec_env_vars()
 
+    # MPS colocate: claim infer_frac of each bundle (the trainer will claim
+    # train_frac so the two together fit, with headroom). Plus inject MPS
+    # client env vars + expandable_segments allocator. See Phase 1 in
+    # docs/colocate/implementation.md.
+    if is_mps_colocate(args):
+        sgl_num_gpus = float(getattr(args, "infer_frac", 0.45) or 0.45)
+        sgl_num_cpus = sgl_num_gpus
+        env_vars = {
+            **env_vars,
+            **mps_client_env(),
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+        }
+    else:
+        sgl_num_gpus = 0.2
+        sgl_num_cpus = 0.2
+
     # Step 1: Create all engine actors (without calling init yet)
     engines = []
     for i in range(num_engines):
@@ -208,8 +227,8 @@ def _prepare_sgl_engines(
         )
 
         engine = SglRayActor.options(
-            num_cpus=0.2,
-            num_gpus=0.2,
+            num_cpus=sgl_num_cpus,
+            num_gpus=sgl_num_gpus,
             scheduling_strategy=scheduling_strategy,
             runtime_env={"env_vars": env_vars},
         ).remote(

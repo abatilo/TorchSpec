@@ -1,0 +1,411 @@
+"""Colocate (training+inference on same GPU) smoke tests on Modal.
+
+Each phase from `docs/colocate/implementation.md` has its own entry point
+here. The image, volumes, and secrets are shared across phases. Local
+torchspec/, tests/, and patches/ are overlaid on top of a pinned upstream
+commit so iterating on code does NOT require an image rebuild.
+
+Setup (one-time):
+    modal token set --token-id <id> --token-secret <secret> --profile=doordash
+    modal profile activate doordash
+    bash scripts/modal/setup_modal_secrets.sh --env sandbox
+
+Run smoke tests (each function is a separate Modal `local_entrypoint`):
+    modal run --env sandbox scripts/modal/modal_colocate_smoke.py::phase1_placement
+    modal run --env sandbox scripts/modal/modal_colocate_smoke.py::phase2_union_world
+    modal run --env sandbox scripts/modal/modal_colocate_smoke.py::phase3_p2p_dummy
+    modal run --env sandbox scripts/modal/modal_colocate_smoke.py::phase4_one_step
+    modal run --detach --env sandbox scripts/modal/modal_colocate_smoke.py::phase6_stability
+    modal run --env sandbox scripts/modal/modal_colocate_smoke.py::phase7_grad_parity
+
+Notes:
+- All phases default to a 4×H100 single-node container — that's the size the
+  implementation plan specifies as the smoke-test target. Override at the CLI
+  via `--gpu` for ad-hoc experiments.
+- MPS is enabled by phase-1 onwards; the Modal H100 image already ships
+  `nvidia-cuda-mps-control` as part of the CUDA toolkit, so no extra apt
+  package is needed.
+- Phase 0 is unit-only (no GPU) — run it locally with `pytest tests/colocate/
+  test_phase0_validation.py`.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from typing import Optional
+
+import modal
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+TORCHSPEC_REPO = "https://github.com/zhubohao911/TorchSpec.git"
+TORCHSPEC_BRANCH = "feature/colocate-training-inference"
+# Bump to bust the Modal image cache when the upstream pinned commit changes.
+TORCHSPEC_PIN_COMMIT = "cbecbec"
+SGLANG_COMMIT = "0f2df9370a1de1b4fb11b071d39ab3ce2287a350"
+SGLANG_PATCH_VERSION = "v0.5.8.post1"
+
+REPO_DIR = "/workspace/TorchSpec"
+SGLANG_DIR = f"{REPO_DIR}/_sglang"
+HF_CACHE_DIR = "/root/.cache/huggingface"
+OUTPUTS_DIR = "/workspace/outputs"
+
+# 4×H100 — the smoke-test target from implementation.md (Phase 1+).
+DEFAULT_GPU = "H100:4"
+
+# =============================================================================
+# Modal app + volumes
+# =============================================================================
+
+app = modal.App("torchspec-colocate-smoke")
+
+hf_cache_vol = modal.Volume.from_name(
+    "torchspec-colocate-hf-cache", create_if_missing=True
+)
+outputs_vol = modal.Volume.from_name(
+    "torchspec-colocate-outputs", create_if_missing=True
+)
+
+# =============================================================================
+# Container image — shared by every phase.
+# Mirrors the dflash branch's modal_dflash_train image (same CUDA/PyTorch/sglang
+# versions, same Mooncake binary patch, same env-var fixes).
+# =============================================================================
+
+base_image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
+    )
+    .apt_install(
+        "git", "vim", "htop",
+        # RDMA libs — required by Mooncake (used by the disaggregated baseline
+        # we run in Phase 7's control arm).
+        "libibverbs-dev", "librdmacm-dev", "libnuma-dev",
+        "libcurl4-openssl-dev",
+        # MPS daemon ships with the CUDA toolkit base image, so no extra apt
+        # package is needed for `nvidia-cuda-mps-control`.
+    )
+    .pip_install(
+        "torch", "torchvision", "torchaudio",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .run_commands(
+        f"git clone {TORCHSPEC_REPO} {REPO_DIR}",
+        f"cd {REPO_DIR} && git checkout {TORCHSPEC_BRANCH} && "
+        f"git reset --hard {TORCHSPEC_PIN_COMMIT}",
+    )
+    .pip_install(
+        "huggingface_hub[hf_transfer]",
+        "transformers==4.57.1",
+        "datasets",
+        "tqdm",
+        "wandb",
+        "accelerate",
+        "pydantic",
+        "omegaconf",
+        "ray",
+        "mooncake-transfer-engine",
+        "sglang-router",
+        "openai",
+        "openai-harmony",
+        "qwen-vl-utils",
+        "psutil",
+        "numpy<2.4",
+        "pyzmq",
+        "numba",
+        "cmake",
+        "ninja",
+        "packaging",
+        "setuptools",
+        "pytest",
+    )
+    .run_commands(f"cd {REPO_DIR} && pip install -e '.[dev]'")
+    # Mooncake binary perms (mirrors Dockerfile.runpod Layer 6 from the
+    # dflash branch).
+    .run_commands(
+        "MOONCAKE_DIR=$(python3 -c \"import mooncake, os; "
+        "print(os.path.dirname(mooncake.__file__))\") && "
+        "chmod 755 \"$MOONCAKE_DIR/mooncake_master\" 2>/dev/null || true && "
+        "sed -i 's/os.chmod(bin_path, 0o755)/pass/' "
+        "\"$MOONCAKE_DIR/cli.py\" 2>/dev/null || true",
+    )
+    .run_commands(
+        "mkdir -p /root/.cache && "
+        "ln -sf /root/.cache/huggingface /root/.cache/huggingface || true",
+    )
+    .env(
+        {
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            # PyTorch <2.9 still reads the old name — set both for safety
+            # since we want fragmentation-friendly allocator under MPS.
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS": "ATEN,TRITON",
+            "TORCHSPEC_LOG_LEVEL": "INFO",
+            "HF_HOME": HF_CACHE_DIR,
+        }
+    )
+)
+
+sglang_image = (
+    base_image
+    .run_commands(
+        f"git clone https://github.com/sgl-project/sglang.git {SGLANG_DIR}",
+        f"cd {SGLANG_DIR} && git checkout {SGLANG_COMMIT} && git reset --hard HEAD",
+        f"cd {REPO_DIR} && pip install -e '_sglang/python[all]'",
+        f"rm -f {SGLANG_DIR}/python/sglang/srt/speculative/spec_training_info.py",
+        f"cd {SGLANG_DIR} && git apply "
+        f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/sglang.patch || true",
+    )
+    # Overlay local working tree on top of the pinned commit.
+    .add_local_dir("torchspec", f"{REPO_DIR}/torchspec", copy=True)
+    .add_local_dir("tests", f"{REPO_DIR}/tests", copy=True)
+    .add_local_dir("patches", f"{REPO_DIR}/patches", copy=True)
+    .add_local_dir("configs", f"{REPO_DIR}/configs", copy=True)
+    .add_local_dir("scripts/tools", f"{REPO_DIR}/scripts/tools", copy=True)
+)
+
+
+_common_kwargs = dict(
+    volumes={
+        HF_CACHE_DIR: hf_cache_vol,
+        OUTPUTS_DIR: outputs_vol,
+    },
+    timeout=24 * 3600,
+    secrets=[
+        modal.Secret.from_name("xingh3-hf-write"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
+)
+
+
+# =============================================================================
+# Helpers used inside the container
+# =============================================================================
+
+
+def _gpu_banner() -> int:
+    import torch
+
+    detected = torch.cuda.device_count()
+    print(f"  GPUs detected: {detected}")
+    for i in range(detected):
+        name = torch.cuda.get_device_name(i)
+        props = torch.cuda.get_device_properties(i)
+        mem_gb = (
+            getattr(props, "total_memory", getattr(props, "total_mem", 0)) / 1e9
+        )
+        print(f"    GPU {i}: {name} ({mem_gb:.1f} GB)")
+    return detected
+
+
+def _hf_token_setup() -> None:
+    import os
+    import shutil
+
+    os.environ["HF_HOME"] = HF_CACHE_DIR
+    hf_token = os.environ.get("HF_WRITE_TOKEN")
+    if not hf_token:
+        return
+    os.environ["HF_TOKEN"] = hf_token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+    os.makedirs(HF_CACHE_DIR, exist_ok=True)
+    for token_file in [
+        os.path.join(HF_CACHE_DIR, "token"),
+        os.path.expanduser("~/.huggingface/token"),
+    ]:
+        os.makedirs(os.path.dirname(token_file), exist_ok=True)
+        with open(token_file, "w") as f:
+            f.write(hf_token)
+    stored_dir = os.path.join(HF_CACHE_DIR, "stored_tokens")
+    if os.path.isdir(stored_dir):
+        shutil.rmtree(stored_dir)
+
+
+def _run_pytest(test_path: str, extra_args: Optional[list[str]] = None) -> int:
+    """Run a pytest target inside the container; return exit code."""
+    cmd = [sys.executable, "-m", "pytest", "-xvs", test_path]
+    if extra_args:
+        cmd.extend(extra_args)
+    print("  $", " ".join(cmd))
+    proc = subprocess.run(cmd, cwd=REPO_DIR)
+    return proc.returncode
+
+
+# =============================================================================
+# Phase 1 — placement + MPS
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+def _run_phase1_placement():
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_placement.py")
+    if rc != 0:
+        raise RuntimeError(f"phase1_placement failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase1_placement():
+    """Placement: 1:1 bundle pairing + MPS daemon env vars."""
+    _run_phase1_placement.remote()
+
+
+# =============================================================================
+# Phase 2 — union NCCL world
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu="H100:8", **_common_kwargs)
+def _run_phase2_union_world():
+    """Phase 2 deliberately uses 8 GPUs (one per rank, no MPS sharing) to
+    isolate the union-world bootstrap from MPS sharing. The MPS+union-world
+    integration is Phase 4's hidden-state hook; per the implementation.md
+    risk register, Phase 2 should validate the bootstrap mechanism alone.
+    """
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_union_world.py")
+    if rc != 0:
+        raise RuntimeError(f"phase2_union_world failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase2_union_world():
+    """Union NCCL world: 2*N rank barrier + FSDP-only subgroup."""
+    _run_phase2_union_world.remote()
+
+
+# =============================================================================
+# Phase 3 — NCCL P2P dummy transfer
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+def _run_phase3_p2p_dummy():
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_p2p_dummy.py")
+    if rc != 0:
+        raise RuntimeError(f"phase3_p2p_dummy failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase3_p2p_dummy():
+    """100-iteration dummy P2P byte-equality test."""
+    _run_phase3_p2p_dummy.remote()
+
+
+# =============================================================================
+# Phase 4 — real hidden-state hook (one training step)
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+def _run_phase4_one_step():
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_one_step.py")
+    if rc != 0:
+        raise RuntimeError(f"phase4_one_step failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase4_one_step():
+    """Run a single colocate training step on Qwen3-8B (TP=4 + FSDP=4)."""
+    _run_phase4_one_step.remote()
+
+
+# =============================================================================
+# Phase 6 — 1000-step stability (slow)
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+def _run_phase6_stability():
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest(
+        "tests/colocate/test_stability.py",
+        extra_args=["-m", "slow"],
+    )
+    if rc != 0:
+        raise RuntimeError(f"phase6_stability failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase6_stability():
+    """Slow: 1000-step run, assert flat peak alloc."""
+    _run_phase6_stability.remote()
+
+
+# =============================================================================
+# Phase 7 — grad parity (one-step) and convergence (slow)
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+def _run_phase7_grad_parity():
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_grad_parity.py")
+    if rc != 0:
+        raise RuntimeError(f"phase7_grad_parity failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase7_grad_parity():
+    """Per-parameter gradient parity vs disaggregated baseline."""
+    _run_phase7_grad_parity.remote()
+
+
+@app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
+def _run_phase7_convergence():
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest(
+        "tests/colocate/test_convergence.py",
+        extra_args=["-m", "slow"],
+    )
+    if rc != 0:
+        raise RuntimeError(f"phase7_convergence failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase7_convergence():
+    """Slow: 1k-step loss-curve overlap (run with --detach)."""
+    _run_phase7_convergence.remote()
+
+
+# =============================================================================
+# Sanity: container probe (no test, just confirms the image starts up).
+# =============================================================================
+
+
+@app.function(image=sglang_image, gpu="H100:1", **_common_kwargs)
+def _run_probe():
+    _gpu_banner()
+    print("\n  --- nvidia-smi ---")
+    subprocess.run(["nvidia-smi"], check=False)
+    print("\n  --- nvidia-cuda-mps-control --version ---")
+    subprocess.run(
+        ["nvidia-cuda-mps-control", "-V"], check=False
+    )  # `-V` is a noop in some builds; we just want the binary to be present
+    print("\n  --- python imports ---")
+    import torch
+    print(f"  torch {torch.__version__}")
+    try:
+        import sglang  # noqa: F401
+        print("  sglang OK")
+    except Exception as e:
+        print(f"  sglang import failed: {e}")
+
+
+@app.local_entrypoint()
+def probe():
+    """Single-GPU sanity probe: image starts, MPS binary present, sglang imports."""
+    _run_probe.remote()
