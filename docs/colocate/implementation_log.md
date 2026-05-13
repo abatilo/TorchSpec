@@ -859,4 +859,69 @@ Pure docs + example. No Modal time required.
 
 ## Open questions / risk register addenda
 
-_(none yet — populate when blockers surface during execution)_
+### Modal sandbox MPS limitation (discovered Phase 4 one-step run)
+
+`phase4_one_step` on Modal `sandbox` H100:4 surfaced two real
+infrastructure pain points that the upfront design hadn't predicted.
+
+**1. MPS server fails with "operation not supported".** The MPS
+control daemon (`nvidia-cuda-mps-control -d`) starts cleanly on
+Modal sandbox H100 nodes, but every per-GPU server it spawns dies
+with `Failed to start : operation not supported` (visible in
+`/tmp/nvidia-log/server.log`). Once the daemon is up, *every* CUDA
+process on the node has to set `CUDA_MPS_PIPE_DIRECTORY` and
+register with the broken server, which surfaces as `CUDA error 805:
+MPS client failed to connect to the MPS control daemon or the MPS
+server`. Root cause is the Modal container not passing
+`--ipc=host` / `SYS_ADMIN` to the runtime; we don't control that.
+
+**Fix:** detect at driver-startup time, fall back gracefully.
+`setup_for_colocate` now spawns a tiny CUDA probe subprocess
+(`cuInit + cuDeviceGetCount` via `libcuda.so.1`) right after the
+daemon comes up. If the probe returns non-zero or
+`server.log` shows `operation not supported`, we tear the daemon
+down and return `(None, {})`. The driver records
+`args.colocate_mps_unavailable = True`, and `train_group.py` /
+`inference/factory.py` skip injecting `CUDA_MPS_PIPE_DIRECTORY`
+into actor `runtime_env`s. Trainer + engine still claim fractional
+GPU (Ray placement-group invariant unchanged) but their CUDA
+contexts run *serially* instead of overlapping. Functional Phase-4
+pipeline works; you only lose the MPS-driven kernel-concurrency
+optimisation Modal sandbox couldn't have given us anyway.
+`TORCHSPEC_DISABLE_MPS=1` is the same kill-switch for environments
+where ops know MPS won't work.
+
+**2. `init_process_group(device_id=...)` is too eager for
+slow-startup engines.** Eager-init NCCL exhausts its
+`socketPollConnect` retry counter (35 retries, ~30 s) before the
+engine's sglang scheduler subprocess has finished booting +
+downloading the Qwen3-8B weights. Trainers tear out with
+
+```
+socketPollConnect: connect ... returned Connection refused,
+exceeded error retry count after 35 attempts
+```
+
+while the engine is still on its second HF retry.
+
+**Fix:** drop `device_id=` from both sides of the union-world
+`init_process_group` (TorchSpec `colocate/world.py` and the
+sglang patch's `init_union_default_pg`). NCCL falls back to lazy
+init — the handshake happens on the first collective op, which
+inherits the 10-minute `timeout=` we already pass. The Phase-3
+"Ray-CUDA-isolation deadlock" that motivated `device_id=` doesn't
+apply to the union world (each rank's `CUDA_VISIBLE_DEVICES` is
+already its assigned bundle). We pay a ~µs init-latency tax in
+exchange for letting cold engines catch up.
+
+Both fixes shipped in commits
+`9824bf8 colocate: detect 'MPS not supported' and fall back ...`
+and
+`4c1e042 colocate: switch union world to lazy NCCL init ...` —
+plus the diagnostic plumbing
+(`58be9c7 colocate: dump MPS daemon log on CUDA error 805`,
+`b923736 tests/colocate/one_step: dump nvidia-mps daemon log on
+failure`,
+`33d71fa tests/colocate/one_step: stream subprocess output ...`)
+that made these failures debuggable in pytest's captured-stdout
+format.
