@@ -133,10 +133,24 @@ def _build_args(world_size: int = 4):
 
 @pytest.fixture(scope="module")
 def mps_handle():
-    """Start MPS daemon (idempotent) for the test session."""
+    """Start MPS daemon (idempotent) for the test session.
+
+    ``setup_for_colocate`` returns ``(None, {})`` on hosts where the
+    MPS daemon comes up but the per-GPU server can't actually create
+    a CUDA context (Modal sandbox H100 nodes — see
+    docs/colocate/implementation_log.md). The fractional-share test
+    exercises a real client-side MPS connection so we have to skip
+    instead of return None.
+    """
     if not is_mps_available():
         pytest.skip("nvidia-cuda-mps-control not on PATH")
     handle, _ = setup_for_colocate()
+    if handle is None:
+        pytest.skip(
+            "MPS server reported 'operation not supported' (likely a "
+            "container without --ipc=host); see "
+            "docs/colocate/implementation_log.md."
+        )
     yield handle
     if handle.started_by_us:
         stop_mps_daemon(handle)
