@@ -312,12 +312,42 @@ def phase3_p2p_dummy():
 
 
 # =============================================================================
-# Phase 4 — real hidden-state hook (one training step)
+# Phase 4 — real hidden-state hook (multi-tensor P2P + one training step)
 # =============================================================================
+
+
+@app.function(image=sglang_image, gpu="H100:2", **_common_kwargs)
+def _run_phase4_multi_tensor():
+    """Phase 4 multi-tensor round-trip on the union world (2-rank).
+
+    Validates the in-repo half of Phase 4: NcclHiddenStatesConnector
+    sends a Mooncake-shaped tensor dict (hidden_states +
+    aux_hidden_states + last_hidden_states + target_logits), and
+    NcclMultiTensorFetcher receives it with byte equality on every
+    tensor. This is the maximal e2e check we can run without the
+    upstream sglang patch — the patch is required for the "one full
+    training step" deliverable, which lives in `_run_phase4_one_step`."""
+    _gpu_banner()
+    _hf_token_setup()
+    rc = _run_pytest("tests/colocate/test_p2p_multi_tensor.py")
+    if rc != 0:
+        raise RuntimeError(f"phase4_multi_tensor failed (exit {rc})")
+
+
+@app.local_entrypoint()
+def phase4_multi_tensor():
+    """Multi-tensor NCCL P2P round-trip (Mooncake-shaped dict)."""
+    _run_phase4_multi_tensor.remote()
 
 
 @app.function(image=sglang_image, gpu=DEFAULT_GPU, **_common_kwargs)
 def _run_phase4_one_step():
+    """Phase 4 one-step training (requires upstream sglang patch).
+
+    See ``docs/colocate/sglang_patch.md`` for the patch surface. Without
+    that patch the engine's spec_training callback writes to a (now
+    non-existent) Mooncake store and the trainer hangs on its first P2P
+    recv. The test file is parked here for when the patch lands."""
     _gpu_banner()
     _hf_token_setup()
     rc = _run_pytest("tests/colocate/test_one_step.py")
@@ -327,7 +357,10 @@ def _run_phase4_one_step():
 
 @app.local_entrypoint()
 def phase4_one_step():
-    """Run a single colocate training step on Qwen3-8B (TP=4 + FSDP=4)."""
+    """Run a single colocate training step on Qwen3-8B (TP=4 + FSDP=4).
+
+    Requires the upstream sglang patch — see docs/colocate/sglang_patch.md.
+    """
     _run_phase4_one_step.remote()
 
 

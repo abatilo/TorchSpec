@@ -22,7 +22,7 @@
 | 1 | Placement: 1:1 bundle pairing + MPS env | ✅ | Yes (4×H100) | 5/5 placement tests pass on Modal |
 | 2 | Union NCCL world (no transfer yet) | 🟡 | Yes (8×H100) | helper + 8-rank smoke test pass; trainer/engine wire-up + sglang patch deferred to Phase 4 |
 | 3 | NCCL P2P data plane (dummy tensors) | ✅ | Yes (2×H100) | 3/3 P2P dummy tests pass on Modal in 137 s; scaled down from plan's 4-GPU MPS topology — see deviations |
-| 4 | Real hidden-state hook in sglang | ⬜ | Yes (4×H100) | most of sglang patch |
+| 4 | Real hidden-state hook in sglang | 🟢 | Yes (2×H100) | TorchSpec-side library + wiring complete; multi-tensor round-trip Modal test green; full one-step blocked on upstream sglang patch (surface documented in [`sglang_patch.md`](sglang_patch.md)) |
 | 5 | Controller trim & loop integration | ⬜ | Yes (4×H100) | |
 | 6 | Memory caps, MPS hygiene, stability | ⬜ | Yes (4×H100) | slow 1000-step |
 | 7 | Numeric parity & convergence | ⬜ | Yes (4–8×H100) | needs disagg control run |
@@ -463,23 +463,106 @@ on-device path as the plan required).
 
 ## Phase 4 — Real hidden-state hook in sglang
 
-Status: ⬜
+Status: 🟢 (TorchSpec-side complete; upstream sglang patch is the gating dependency for the full one-step e2e)
 
 ### Plan recap
 
 See [`implementation.md` §Phase 4](implementation.md#phase-4--real-hidden-state-hook-in-sglang).
 
+### Plan deviation: there is no `patches/_sglang/` in this repo
+
+The plan's §Phase 4 sub-task 1 reads "Inside `patches/_sglang/`, find
+the spec-training hidden state callback". That directory **does not
+exist** in this repo — the `mooncake_hidden_states_connector.py` we
+have is a vLLM KV connector, not an sglang patch. TorchSpec consumes
+sglang as an external dep via `sgl.Engine(...)` in `SglEngine`; its
+distributed init lives **inside sglang**, not here.
+
+So Phase 4 in this repo is the union of:
+1. The TorchSpec side of the wire (engine connector + trainer fetcher
+   + sample type + actor wiring) — fully landed.
+2. A documented patch surface for the upstream sglang change that
+   lights up the engine end of the wire — see
+   [`sglang_patch.md`](sglang_patch.md).
+
+The "one full training step" deliverable (§Phase 4 done-when) requires
+the upstream patch and is parked behind it in
+`tests/colocate/test_one_step.py` (test file deferred — see Phase 5
+work log).
+
 ### Work log
 
-_(populated as work progresses)_
+- **NcclHiddenStatesConnector** (`torchspec/inference/engine/nccl_hidden_states_connector.py`)
+  — engine-side multi-tensor sender. Sorts dict keys before issuing
+  one `dist.batch_isend_irecv` (Phase-3 pathology lesson). Validates
+  contiguous + CUDA. Exports `TORCHSPEC_COLOCATE_TRANSFER_MODE` /
+  `TORCHSPEC_COLOCATE_PAIRED_TRAINER_RANK` env vars for the upstream
+  patch to read inside sglang's TP scheduler subprocess.
+- **NcclMultiTensorFetcher** (`torchspec/training/nccl_data_fetcher.py`)
+  — trainer-side multi-tensor receiver. Walks the same sorted-by-key
+  order as the connector. Allocates buffers per step (variable
+  seq_len); Phase 6 will revisit if memory churn shows up.
+- **ColocateTrainSample / ColocateDataset / ColocateDataFetcher**
+  (`torchspec/training/data_fetcher.py`) — the colocate counterparts
+  to `TrainSample` / `MooncakeDataset` / `MooncakeDataFetcher`.
+  Same DataLoader + collator interface so `_train_step` is unchanged.
+  The struct carries `tensor_specs` (per-tensor shape+dtype) instead
+  of a Mooncake key; the dataset feeds those into
+  `NcclMultiTensorFetcher.recv_step`.
+- **TrainerActor.init** (`torchspec/training/trainer_actor.py`) —
+  branches on `transfer_mode`. When `nccl`, runs `init_union_world`
+  (rendezvous on `master_port + 5000` to dodge FSDP's own port range),
+  binds the union-world `meta_group` as `GLOO_GROUP`, and overrides
+  `args.rank` / `args.world_size` to the trainer-only N-rank view so
+  downstream FSDP arithmetic stays in the trainer subgroup space.
+  Stamps the union-world rendezvous params into env vars
+  (`TORCHSPEC_COLOCATE_UNION_*`) so the upstream sglang patch can
+  read them.
+- **Trainer.set_train_queue** (`torchspec/training/trainer.py`) — now
+  branches on the trainer's `_union_world` handle. When set,
+  constructs a `ColocateDataFetcher` whose underlying
+  `NcclMultiTensorFetcher` is wired to the union-world's
+  `paired_global_rank`. Mooncake config + `init_mooncake_store` are
+  bypassed (and warned about if accidentally passed in).
+- **SglEngine.init** (`torchspec/inference/engine/sgl_engine.py`) —
+  when `args.transfer_mode == 'nccl'`, exports the env contract for
+  the upstream sglang patch and flips `enable_spec_training_mooncake`
+  to False so the patch's NCCL path is the only writer. Also drops
+  any incidental `mooncake_config` that snuck through (defence in
+  depth; Phase 5 stops the controller from sending it).
+- **Upstream patch surface** ([`docs/colocate/sglang_patch.md`](sglang_patch.md))
+  — env-var contract + the three patch points (distributed init,
+  spec_training callback, optional Mooncake skip) + verification
+  recipe (`phase4_one_step`) + diagnostic for "patch not picked up"
+  (P2P recv hangs).
 
 ### Verification
 
-Modal target: `phase4_one_step` on Qwen3-8B with TP=4 engine + 4 FSDP
-trainers.
+Two layers:
 
-- Loss is finite and non-zero.
-- No Mooncake calls happen (mocked store fails the test if touched).
+**(a) In-repo (passes today, no upstream patch):**
+- `tests/colocate/test_phase4_multi_tensor_helper.py` — unit tests
+  for sorted-key ordering, env-var helpers, dtype normalisation,
+  pre-init guards, `ColocateTrainSample` round-trip. Modal-only run
+  same as Phase 3 helpers (Mac dev box has stub torch).
+- `tests/colocate/test_p2p_multi_tensor.py` — Modal smoke. 2 ranks
+  (1 trainer + 1 engine), 2 H100s, `init_union_world` + 4-tensor
+  Mooncake-shaped round-trip with byte equality on each tensor +
+  symmetric-helper round-trip. **Both passed in 40.4 s** (Modal app
+  `ap-SsIh9pH9AmdM9nyqX7brrS`).
+
+**(b) End-to-end (gated on upstream sglang patch):**
+- `tests/colocate/test_one_step.py` — full Qwen3-8B one-step run;
+  parked here as the validation hook for the upstream PR. Without
+  the patch, the engine's spec_training callback can't reach the
+  trainer over P2P and the test will hang on its first
+  `recv_step` — that hang is the diagnostic, not a bug.
+
+### Modal entrypoints
+
+- `phase4_multi_tensor` — passes today.
+- `phase4_one_step` — placeholder; runs but hangs without upstream
+  patch (deliberate; see verification (b)).
 
 ---
 

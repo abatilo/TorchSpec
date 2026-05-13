@@ -1,14 +1,14 @@
 # Copyright (c) 2026 LightSeek Foundation
 # MIT License
 
-"""NCCL P2P data fetcher for colocate mode (Phase 3).
+"""NCCL P2P data fetcher for colocate mode (Phases 3 & 4).
 
 This is the trainer-side counterpart to the engine's hidden-state writer.
 Whereas the disaggregated path goes engine → Mooncake store → trainer
 (``MooncakeDataFetcher``), the colocate path is engine → NCCL P2P send →
 trainer recv into a pre-allocated buffer on the same physical GPU.
 
-Phase 3 ships only the minimal building block:
+Phase 3 ships the minimal single-tensor primitive:
 
     NcclDataFetcher(
         src_rank=engine_rank,
@@ -16,22 +16,33 @@ Phase 3 ships only the minimal building block:
         dtype=torch.bfloat16,
         device=torch.device('cuda'),
     )
-    tensor = fetcher.recv()  # blocks on dist.recv
+    tensor = fetcher.recv()
 
-The buffer is pre-allocated and re-used across calls so the per-step cost
-is one ``cudaMemcpyDtoD`` (when ``clone=True``) or zero (when the caller
-promises not to mutate the returned tensor).
+Phase 4 ships the generalised multi-tensor receiver,
+:class:`NcclMultiTensorFetcher`, which assembles a Mooncake-shaped
+batch dict (``hidden_states``, ``aux_hidden_states``,
+``last_hidden_states``, ``target_logits`` … the exact key set is
+draft-model-dependent) and pulls per-step CPU-side metadata
+(``input_ids``, ``packed_loss_mask``) from a Ray queue. The trainer's
+``_train_step`` consumes batches identically whether they came from the
+Mooncake or NCCL fetcher.
 
-Phase 4 will wrap this to also receive the aux-layer hidden states and
-``last_hidden_states`` and assemble them into the same batch-dict shape
-``MooncakeDataFetcher`` produces, so ``Eagle3Trainer._train_step`` doesn't
-need to know which fetcher is wired up.
+Wire protocol
+-------------
+
+The engine and trainer agree on the per-step ``Dict[str, Tensor]`` key
+set via the metadata channel (a Ray queue carrying
+:class:`torchspec.training.data_fetcher.ColocateTrainSample`). Both sides
+send/recv tensors in **sorted-by-key** order (see
+``NcclHiddenStatesConnector.sorted_tensor_names``). All tensor ops for
+one step happen in a single ``dist.batch_isend_irecv`` to avoid the
+lazy 2-rank sub-communicator pathology that bit Phase 3.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -164,3 +175,168 @@ def send_dummy(
     for work in works:
         work.wait()
     return tensor
+
+
+# ----------------------------------------------------------------------
+# Phase 4: multi-tensor receiver + iterator over Ray queue of metadata.
+# ----------------------------------------------------------------------
+
+
+# Public type alias for what a per-tensor specification looks like on the
+# wire. The metadata channel carries one of these per tensor name; both
+# engine and trainer use it to know shape/dtype before the P2P call.
+TensorSpec = Tuple[Tuple[int, ...], torch.dtype]
+
+
+def _sorted_tensor_names(specs: Dict[str, TensorSpec]) -> List[str]:
+    """Canonical send/recv ordering: sorted by key.
+
+    Mirrored in ``torchspec.inference.engine.nccl_hidden_states_connector``.
+    The two sides never exchange the order explicitly; agreeing on
+    ``sorted(keys)`` removes a class of bugs where a dict-ordering
+    difference between Python versions / HF model configs would cause
+    silent data corruption.
+    """
+    return sorted(specs.keys())
+
+
+def _normalise_dtype(dtype: Any) -> torch.dtype:
+    """Accept either a ``torch.dtype`` or a string from the metadata channel.
+
+    The metadata channel runs over Ray queues, which serialise via
+    cloudpickle. ``torch.dtype`` survives cloudpickle but
+    ``Mooncake``-shaped metadata sometimes carries dtypes as strings
+    (``"bfloat16"``, ``"torch.bfloat16"``); we accept both for symmetry
+    with :class:`MooncakeDataFetcher`.
+    """
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        return getattr(torch, dtype.replace("torch.", ""))
+    raise TypeError(
+        f"unsupported tensor dtype representation: {dtype!r} (type={type(dtype)})"
+    )
+
+
+class NcclMultiTensorFetcher:
+    """Trainer-side multi-tensor receiver for the colocate path.
+
+    One fetcher per trainer rank (= one per paired engine TP rank). The
+    fetcher exposes a single method, :meth:`recv_step`, that:
+
+      1. Receives the per-step ``Dict[str, Tensor]`` from the paired
+         engine via a single ``batch_isend_irecv``.
+      2. Returns a Mooncake-shaped batch dict, with optional CPU-side
+         metadata (loss mask, input_ids) merged in by the caller.
+
+    The tensor list and shapes change every step (variable seq_len), so
+    we don't pre-allocate buffers. Phase 6 will revisit this if memory
+    churn shows up in the stability test.
+
+    Args:
+        src_global_rank: Global rank to receive from (the paired engine
+            in the union world).
+        device: CUDA device to allocate recv buffers on.
+        group: Process group; defaults to the default (union world).
+
+    Raises:
+        RuntimeError: torch.distributed not initialised.
+        ValueError: ``device`` is not a CUDA device.
+    """
+
+    def __init__(
+        self,
+        src_global_rank: int,
+        device: torch.device,
+        group: Optional[dist.ProcessGroup] = None,
+    ):
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "NcclMultiTensorFetcher requires torch.distributed to be "
+                "initialised (call init_union_world first)."
+            )
+        if device.type != "cuda":
+            raise ValueError(
+                f"NcclMultiTensorFetcher requires a CUDA device; got {device}"
+            )
+        self._src = int(src_global_rank)
+        self._device = device
+        self._group = group
+
+    @property
+    def src_global_rank(self) -> int:
+        return self._src
+
+    def recv_step(self, tensor_specs: Dict[str, TensorSpec]) -> Dict[str, torch.Tensor]:
+        """Receive one step's worth of tensors and return them as a dict.
+
+        Args:
+            tensor_specs: dict of name → (shape, dtype). Must match
+                exactly what the engine sends. Both sides walk
+                ``sorted(tensor_specs.keys())``.
+
+        Returns:
+            ``Dict[str, Tensor]`` with the same keys as ``tensor_specs``.
+            Tensors live on ``self._device``. Buffers are freshly
+            allocated each step (variable seq_len).
+
+        Raises:
+            ValueError: empty tensor_specs (likely caller bug).
+        """
+        if not tensor_specs:
+            raise ValueError("recv_step requires at least one tensor spec")
+
+        names = _sorted_tensor_names(tensor_specs)
+        buffers: Dict[str, torch.Tensor] = {}
+        ops = []
+        for name in names:
+            shape, dtype_raw = tensor_specs[name]
+            dtype = _normalise_dtype(dtype_raw)
+            buf = torch.empty(tuple(shape), dtype=dtype, device=self._device)
+            buffers[name] = buf
+            ops.append(dist.P2POp(dist.irecv, buf, peer=self._src, group=self._group))
+
+        logger.debug(
+            "NcclMultiTensorFetcher.recv_step: src=%d names=%s",
+            self._src, names,
+        )
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+        return buffers
+
+
+def send_step(
+    tensors: Dict[str, torch.Tensor],
+    dst_global_rank: int,
+    *,
+    group: Optional[dist.ProcessGroup] = None,
+) -> None:
+    """Convenience symmetric helper for tests / engine-side library calls.
+
+    Equivalent to constructing a one-shot
+    :class:`torchspec.inference.engine.nccl_hidden_states_connector.NcclHiddenStatesConnector`
+    and calling ``.send(tensors)``. We expose it here to keep the test
+    surface minimal and avoid an inference-engine import from the
+    trainer test path.
+    """
+    if not tensors:
+        raise ValueError("send_step requires at least one tensor")
+
+    names = sorted(tensors.keys())
+    ops = []
+    for name in names:
+        t = tensors[name]
+        if not t.is_contiguous():
+            raise ValueError(
+                f"send_step requires contiguous tensors; got non-contiguous '{name}'"
+            )
+        if t.device.type != "cuda":
+            raise ValueError(
+                f"send_step requires CUDA tensors; got '{name}' on {t.device}"
+            )
+        ops.append(dist.P2POp(dist.isend, t, peer=int(dst_global_rank), group=group))
+
+    works = dist.batch_isend_irecv(ops)
+    for work in works:
+        work.wait()

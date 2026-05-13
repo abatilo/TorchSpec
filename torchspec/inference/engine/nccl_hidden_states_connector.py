@@ -1,0 +1,214 @@
+# Copyright (c) 2026 LightSeek Foundation
+# MIT License
+
+"""Engine-side multi-tensor NCCL P2P sender for colocate mode (Phase 4).
+
+This is the engine-side counterpart to ``NcclDataFetcher`` /
+``NcclMultiTensorFetcher`` on the trainer. It mirrors what the disaggregated
+``MooncakeHiddenStatesConnector`` does (write hidden states to a shared
+Mooncake store keyed by ``mooncake_key``), but the wire is a single NCCL
+``batch_isend_irecv`` to the paired trainer rank instead of a TCP write
+to a remote Mooncake server.
+
+Wire protocol
+-------------
+
+Per training step, the engine produces a per-request ``Dict[str, Tensor]``.
+The exact key set depends on the draft model:
+
+- Eagle3 with last_hidden_states + target_logits:
+  ``{"hidden_states", "aux_hidden_states", "last_hidden_states",
+     "target_logits"}``
+- Eagle3 without last_hidden_states (older configs):
+  ``{"hidden_states", "aux_hidden_states", "target_logits"}``
+- DFlash variants: as defined by the draft trainer.
+
+The connector sends the tensors in **sorted-by-key** order via a single
+``dist.batch_isend_irecv`` call. The receiver
+(:class:`torchspec.training.nccl_data_fetcher.NcclMultiTensorFetcher`)
+must agree on this ordering — it does, because it uses the same sort.
+
+Pairing
+-------
+
+Each engine rank ``i`` (in ``[0, N)`` of the engine role, i.e. global rank
+``N+i`` in the union world) is paired with trainer rank ``i`` (global rank
+``i``). The connector therefore needs only its own engine role rank and
+the union-world ``UnionWorld`` handle to pick the destination:
+
+    dst_global_rank = paired_global_rank  # held on UnionWorld
+
+Within an engine TP group, the engine's TP rank-0 worker is the canonical
+sender (sglang's spec_training callback runs there). For TP > 1 the
+local-shard split happens **upstream** of this connector (the sglang patch
+slices the global-batch hidden states by TP rank before invoking the
+callback). This connector is intentionally TP-unaware.
+
+Layering
+--------
+
+This module **does not** depend on sglang. It's a pure
+``torch.distributed`` library function that the upstream sglang patch
+calls. The patch lives outside this repo (see
+``docs/colocate/sglang_patch.md`` for the patch surface). When the
+``transfer_mode == 'nccl'`` flag is set on ``SglEngine``, sgl_engine.py
+exports an env marker (:data:`TRANSFER_MODE_ENV`) and a destination-rank
+table; the patch reads them and instantiates this connector.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, Optional
+
+import torch
+import torch.distributed as dist
+
+logger = logging.getLogger("torchspec.inference.engine.nccl_hidden_states_connector")
+
+# Env marker the engine sets when colocate NCCL transfer is selected. The
+# upstream sglang patch checks this to decide between Mooncake-write and
+# NCCL-send paths in its spec_training callback.
+TRANSFER_MODE_ENV = "TORCHSPEC_COLOCATE_TRANSFER_MODE"
+
+# Env variable carrying the paired trainer global rank. The engine sets
+# this once at init; the patch reads it on each callback invocation.
+PAIRED_TRAINER_RANK_ENV = "TORCHSPEC_COLOCATE_PAIRED_TRAINER_RANK"
+
+
+def sorted_tensor_names(tensors: Dict[str, torch.Tensor]) -> list[str]:
+    """Canonical send/recv ordering: sorted by key.
+
+    Both the sender (this module) and the receiver
+    (:class:`NcclMultiTensorFetcher`) use this to pick the order of P2P
+    ops in a single batched call. Using sorted-by-key lets the two sides
+    agree without a separate handshake message — the metadata channel
+    (gloo group) already carries the dict's key set as part of
+    ``ColocateTrainSample.tensor_specs``.
+    """
+    return sorted(tensors.keys())
+
+
+class NcclHiddenStatesConnector:
+    """Engine-side sender for the colocate hidden-state plane.
+
+    One connector per engine TP rank. The connector holds:
+
+    - the destination global rank (paired trainer in the union world),
+    - the union-world default process group (for the actual send).
+
+    The connector is **stateless across calls** in the sense that it
+    holds no per-tensor buffers — it sends the caller's tensors directly.
+    The sglang patch is responsible for managing the lifetime of those
+    tensors (typically: the callback owns them for the duration of the
+    send, then sglang frees them after the callback returns).
+
+    Args:
+        dst_global_rank: Global rank to send to. For engine role rank
+            ``i`` in a union world of size ``2N`` this is ``i`` (the
+            paired trainer).
+        group: Process group to send on. Defaults to the world default
+            (the union world). Tests can pass a subgroup.
+
+    Raises:
+        RuntimeError: if torch.distributed is not initialised.
+    """
+
+    def __init__(
+        self,
+        dst_global_rank: int,
+        group: Optional[dist.ProcessGroup] = None,
+    ):
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "NcclHiddenStatesConnector requires torch.distributed to be "
+                "initialised (call init_union_world first)."
+            )
+        self._dst = int(dst_global_rank)
+        self._group = group
+
+    @property
+    def dst_global_rank(self) -> int:
+        return self._dst
+
+    def send(self, tensors: Dict[str, torch.Tensor]) -> None:
+        """Send a named-tensor dict to the paired trainer rank.
+
+        The send is synchronous on the calling thread: this function
+        returns only after every P2P op has reported completion. Using a
+        single ``batch_isend_irecv`` issues all ops to NCCL at once,
+        which avoids the lazy 2-rank sub-communicator init pathology of
+        unbatched send/recv on a large parent group (Phase 3 lessons).
+
+        Args:
+            tensors: dict of name → tensor. Every tensor must:
+                - Live on a CUDA device matching the union world's
+                  ``device_id`` for this rank (typically the only GPU
+                  visible under Ray's ``CUDA_VISIBLE_DEVICES`` isolation).
+                - Be contiguous (NCCL P2P requires contiguous memory).
+                - Have a shape and dtype that match what the receiver
+                  pre-allocated, in the same key order this side sends.
+
+        Raises:
+            ValueError: empty tensor dict (the metadata channel does not
+                announce zero-tensor steps; this is always a bug).
+            RuntimeError: NCCL error from the underlying send.
+        """
+        if not tensors:
+            raise ValueError(
+                "NcclHiddenStatesConnector.send requires at least one tensor"
+            )
+
+        names = sorted_tensor_names(tensors)
+        ops = []
+        for name in names:
+            t = tensors[name]
+            if not t.is_contiguous():
+                # We could `t = t.contiguous()` silently, but that hides
+                # an upstream allocator inefficiency that the user
+                # probably wants to see. Fail loud at the boundary.
+                raise ValueError(
+                    f"NcclHiddenStatesConnector requires contiguous tensors; "
+                    f"got non-contiguous '{name}' (shape={tuple(t.shape)})"
+                )
+            if t.device.type != "cuda":
+                raise ValueError(
+                    f"NcclHiddenStatesConnector requires CUDA tensors; "
+                    f"got '{name}' on device {t.device}"
+                )
+            ops.append(dist.P2POp(dist.isend, t, peer=self._dst, group=self._group))
+
+        logger.debug(
+            "NcclHiddenStatesConnector.send: dst=%d names=%s",
+            self._dst, names,
+        )
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+
+
+def export_transfer_mode_env(transfer_mode: str, paired_trainer_rank: int) -> None:
+    """Engine-side helper: surface transfer_mode + pairing to sglang patch.
+
+    The sglang patch (out-of-tree) reads these to decide its
+    spec_training callback path. We set both regardless of mode so the
+    patch can fail loudly if the env is missing — that's how upstream
+    detects "TorchSpec wired me wrong" vs "TorchSpec is genuinely on
+    Mooncake".
+    """
+    import os
+    os.environ[TRANSFER_MODE_ENV] = str(transfer_mode)
+    os.environ[PAIRED_TRAINER_RANK_ENV] = str(int(paired_trainer_rank))
+
+
+def read_transfer_mode_env() -> Optional[str]:
+    """Inverse of :func:`export_transfer_mode_env`. Returns None if unset."""
+    import os
+    return os.environ.get(TRANSFER_MODE_ENV)
+
+
+def read_paired_trainer_rank_env() -> Optional[int]:
+    """Read the paired trainer global rank, or None if unset."""
+    import os
+    val = os.environ.get(PAIRED_TRAINER_RANK_ENV)
+    return int(val) if val is not None else None

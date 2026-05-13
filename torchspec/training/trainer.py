@@ -40,8 +40,13 @@ from torch.distributed.device_mesh import init_device_mesh
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.data.utils import DataCollatorWithPadding
 from torchspec.training import checkpoint
-from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
+from torchspec.training.data_fetcher import (
+    ColocateDataFetcher,
+    MooncakeDataFetcher,
+    PrefetchedDataFetcher,
+)
 from torchspec.training.fsdp import init_empty_weights
+from torchspec.training.nccl_data_fetcher import NcclMultiTensorFetcher
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
@@ -72,10 +77,16 @@ class Trainer(abc.ABC):
         self.draft_model = None
         self.optimizer: Optional[BF16Optimizer] = None
         self.lr_scheduler = None
-        self.data_fetcher: Optional[MooncakeDataFetcher] = None
+        # In disaggregated mode this is a MooncakeDataFetcher; in
+        # colocate mode it's a ColocateDataFetcher (NCCL P2P). The
+        # trainer's _train_step consumes batches identically either way.
+        self.data_fetcher = None
         self.train_queue = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
         self._eval_cache: list[dict] = []
+        # Optional union-world handle, set by TrainerActor when
+        # transfer_mode == 'nccl'. None for disaggregated runs.
+        self._union_world = None
 
         self.prof = TrainProfiler(args)
 
@@ -170,6 +181,35 @@ class Trainer(abc.ABC):
     # Data queue
     # ------------------------------------------------------------------
 
+    def set_union_world(self, union_world) -> None:
+        """Inject the colocate union-world handle from the actor.
+
+        Called by ``TrainerActor.init`` after ``init_union_world`` has
+        run. The handle is consumed in :meth:`set_train_queue` /
+        :meth:`set_eval_queue` to construct the colocate
+        :class:`NcclMultiTensorFetcher`. ``None`` (the default) means
+        we're on the disaggregated Mooncake path.
+        """
+        self._union_world = union_world
+
+    def _is_colocate_nccl(self) -> bool:
+        """True iff this trainer is running the colocate (NCCL P2P) path."""
+        return self._union_world is not None and (
+            getattr(self.args, "transfer_mode", None) == "nccl"
+        )
+
+    def _build_nccl_fetcher(self, gpu_device: torch.device) -> NcclMultiTensorFetcher:
+        """Construct the per-step multi-tensor receiver for the colocate path.
+
+        The paired engine global rank comes from ``self._union_world``;
+        this trainer rank is rank ``i`` in [0,N), the paired engine is
+        global rank ``N+i``.
+        """
+        return NcclMultiTensorFetcher(
+            src_global_rank=self._union_world.paired_global_rank,
+            device=gpu_device,
+        )
+
     def set_train_queue(
         self,
         queue,
@@ -181,13 +221,55 @@ class Trainer(abc.ABC):
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
         if usp_enabled and per_dp_rank_batch_size != 1:
             raise ValueError("USP requires per_dp_rank_batch_size=1")
+
+        gpu_device = torch.cuda.current_device()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
+
+        if self._is_colocate_nccl():
+            # Colocate path: tensors arrive over NCCL P2P from the
+            # paired engine. Mooncake store is unused.
+            if mooncake_config is not None:
+                logger.warning(
+                    "[Rank %s] set_train_queue received mooncake_config but "
+                    "transfer_mode=nccl is active; ignoring it. The "
+                    "controller should not be passing this in colocate mode.",
+                    self.dp_rank,
+                )
+            if usp_enabled:
+                # Defence in depth: TrainerActor.init also rejects this.
+                raise ValueError(
+                    "USP + colocate (transfer_mode='nccl') is not supported."
+                )
+
+            nccl_fetcher = self._build_nccl_fetcher(torch.device("cuda", gpu_device))
+            self.data_fetcher = ColocateDataFetcher(
+                queue=self.train_queue,
+                nccl_fetcher=nccl_fetcher,
+                collator=collator,
+                device=gpu_device,
+                batch_size=per_dp_rank_batch_size,
+                assistant_header_ids=self.assistant_header_ids,
+                end_token_ids=self.end_token_ids,
+                dynamic_loss_mask=self.dynamic_loss_mask,
+                last_turn_loss_only=self.last_turn_loss_only,
+                skip_after_header=self.skip_after_header,
+                min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
+                ttt_length=getattr(self.args, "ttt_length", 1),
+                max_seq_length=getattr(self.args, "max_seq_length", None),
+            )
+            logger.info(
+                "[Rank %s] Colocate (NCCL) data fetcher initialised "
+                "(batch_size=%s, paired_engine_rank=%s)",
+                self.dp_rank, per_dp_rank_batch_size,
+                self._union_world.paired_global_rank,
+            )
+            return
+
+        # Disaggregated (Mooncake) path — unchanged.
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
-
         prefetch_depth = getattr(self.args, "prefetch_depth", 0)
-        gpu_device = torch.cuda.current_device()
 
         # When prefetching, stage data on CPU to avoid GPU contention between
         # background Mooncake TCP transfers and forward/backward compute.

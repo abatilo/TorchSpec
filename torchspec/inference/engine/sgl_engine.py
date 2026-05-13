@@ -157,7 +157,63 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 f"using local GPU {self.local_gpu_id}"
             )
 
+        # Phase 4: surface the colocate transfer mode to the upstream
+        # sglang patch via env vars. The patch (out of repo, see
+        # docs/colocate/sglang_patch.md) reads these from inside
+        # sglang's TP scheduler subprocess and routes the spec_training
+        # callback to NcclHiddenStatesConnector instead of Mooncake.
+        transfer_mode = getattr(self.args, "transfer_mode", None) or "mooncake"
+        if transfer_mode == "nccl":
+            from torchspec.inference.engine.nccl_hidden_states_connector import (
+                export_transfer_mode_env,
+            )
+
+            # The paired trainer global rank is `self.rank` in the union
+            # world (engines occupy ranks [N, 2N), trainers [0, N), so
+            # the engine at engine-role-rank `r` is paired with trainer
+            # global rank `r` directly).
+            export_transfer_mode_env(
+                transfer_mode="nccl",
+                paired_trainer_rank=self.rank,
+            )
+            # Also export the union-world rendezvous params we expect
+            # the patch to read. We forward whatever the trainer side
+            # set on the *driver*; in single-node Modal runs this works
+            # because Ray actors share an env. For multi-node, a
+            # follow-up will need an explicit broadcast (the controller
+            # owns that).
+            for var in (
+                "TORCHSPEC_COLOCATE_UNION_MASTER_ADDR",
+                "TORCHSPEC_COLOCATE_UNION_MASTER_PORT",
+                "TORCHSPEC_COLOCATE_UNION_WORLD_SIZE",
+                "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE",
+                "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN",
+            ):
+                # Already set by Ray-driver inheritance in Modal sandbox;
+                # still log here so a multi-node failure has a paper trail.
+                logger.info(
+                    f"SglEngine rank {self.rank}: union env {var}={os.environ.get(var)!r}"
+                )
+            logger.info(
+                f"SglEngine rank {self.rank}: transfer_mode=nccl, "
+                f"paired_trainer_rank={self.rank}. The upstream sglang "
+                "patch must call init_union_world inside the TP "
+                "scheduler subprocess for the engine→trainer P2P send "
+                "to work."
+            )
+
         self._mooncake_config = mooncake_config
+        if transfer_mode == "nccl" and mooncake_config is not None:
+            # Belt-and-braces: even if a stale config snuck a Mooncake
+            # config in, refuse to wire it in colocate mode so we don't
+            # silently spin up a Mooncake store that nothing reads.
+            logger.warning(
+                f"SglEngine rank {self.rank}: transfer_mode=nccl but a "
+                "mooncake_config was passed; ignoring it. Phase 5 of "
+                "the controller trim will stop sending it."
+            )
+            self._mooncake_config = None
+            mooncake_config = None
         if mooncake_config is not None:
             logger.info(f"SglEngine rank {self.rank}: received mooncake_config={mooncake_config}")
 
@@ -273,6 +329,14 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         max_seq_length = getattr(self.args, "max_seq_length", None)
         _configure_usp_sharded_mooncake_env(self.args, max_seq_length)
 
+        # In colocate (NCCL) mode the spec_training callback should
+        # write hidden states via NcclHiddenStatesConnector, not via
+        # the Mooncake store. We flip the flag here; the upstream
+        # sglang patch is responsible for honouring the env marker
+        # set by export_transfer_mode_env() and dispatching to the
+        # NCCL connector.
+        spec_training_mooncake = transfer_mode != "nccl"
+
         engine_kwargs.update(
             {
                 "model_path": self.args.target_model_path,
@@ -280,7 +344,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 "enable_return_hidden_states": True,
                 "enable_aux_hidden_states": True,
                 "aux_hidden_state_layer_ids": self.aux_hidden_state_layer_ids,
-                "enable_spec_training_mooncake": True,
+                "enable_spec_training_mooncake": spec_training_mooncake,
                 "tp_size": tp_size,
                 "pp_size": pp_size,
                 "base_gpu_id": self.local_gpu_id,
