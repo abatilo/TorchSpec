@@ -29,16 +29,26 @@
 #     not gated, so this is only needed if you change the config.
 #
 # Usage (from a fresh checkout of this repo):
-#   bash scripts/colocate/run_smoke_host.sh                 # full smoke
+#   bash scripts/colocate/run_smoke_host.sh                 # tiny smoke (1 GPU)
 #   bash scripts/colocate/run_smoke_host.sh --skip-setup    # tests only
 #   bash scripts/colocate/run_smoke_host.sh --setup-only    # bootstrap, no tests
+#   bash scripts/colocate/run_smoke_host.sh --full          # tiny + 4xGPU Phase 4/6/7
+#   bash scripts/colocate/run_smoke_host.sh --tests=A,B,C   # run specific test files
 #
 # Environment overrides:
 #   COLOCATE_TINY_CONVERGE_STEPS=50    # default 20; raise for stability
+#   PHASE6_STABILITY_STEPS=200         # default 200; bump to 1000 on 4xH100
+#   PHASE7_CONVERGE_STEPS=50           # default 50; bump to 1000 for full
 #   SGLANG_DIR=/abs/path/to/sglang     # default <repo>/_sglang
 #   PYTHON=python3.11                  # default whatever python3 is on PATH
 #   PIP_INDEX_URL=...                  # default PyPI
 #   COLOCATE_PIN_TORCH=1               # pin torch==2.5.* if you hit a wheel mismatch
+#
+# Exit codes:
+#   0 — every selected test either PASSED or SKIPPED (clean)
+#   1 — host pre-flight failed (no GPU / no MPS binary / no driver)
+#   2 — invalid CLI flag
+#   non-0 from pytest — at least one test FAILED; see captured log
 #
 # What it does:
 #   1. (setup) Clone sglang at the pinned commit and apply both patches
@@ -74,11 +84,15 @@ PIP="$PYTHON -m pip"
 
 DO_SETUP=1
 DO_RUN=1
+RUN_FULL=0
+TESTS_OVERRIDE=""
 
 for arg in "$@"; do
   case "$arg" in
     --skip-setup) DO_SETUP=0 ;;
     --setup-only) DO_RUN=0 ;;
+    --full) RUN_FULL=1 ;;
+    --tests=*) TESTS_OVERRIDE="${arg#--tests=}" ;;
     --help|-h)
       grep -E '^# ' "$0" | sed 's/^# \?//'
       exit 0
@@ -178,13 +192,45 @@ echo "MPS daemon binary: $(command -v nvidia-cuda-mps-control)"
 # 3. Run
 # ---------------------------------------------------------------------------
 
-banner "pytest tests/colocate/test_colocate_tiny.py"
+# Pick which test files to run.
+if [[ -n "$TESTS_OVERRIDE" ]]; then
+  IFS=',' read -ra TEST_FILES <<< "$TESTS_OVERRIDE"
+elif [[ $RUN_FULL -eq 1 ]]; then
+  # 4×H100-class hosts: run the tiny + every MPS-gated full test. Each
+  # test self-skips if its preconditions aren't met (e.g. has_h100_quad
+  # for the Qwen3-8B tests; mps_works for everything), so this is safe
+  # to run on a 1-GPU host too — the 4-GPU tests just SKIP cleanly.
+  TEST_FILES=(
+    "tests/colocate/test_colocate_tiny.py"
+    "tests/colocate/test_one_step.py"
+    "tests/colocate/test_grad_parity.py"
+    "tests/colocate/test_stability.py"
+    "tests/colocate/test_convergence.py"
+  )
+else
+  TEST_FILES=(
+    "tests/colocate/test_colocate_tiny.py"
+  )
+fi
+
+banner "pytest: ${TEST_FILES[*]}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export TORCHSPEC_LOG_LEVEL="${TORCHSPEC_LOG_LEVEL:-INFO}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Default CUDA_VISIBLE_DEVICES depends on whether we're running --full
+# (multi-GPU) or just the tiny smoke. Don't override an already-set value.
+if [[ -z "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+  if [[ $RUN_FULL -eq 1 ]] && [[ "$GPU_COUNT" -ge 4 ]]; then
+    export CUDA_VISIBLE_DEVICES="0,1,2,3"
+  else
+    export CUDA_VISIBLE_DEVICES="0"
+  fi
+fi
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 cd "$REPO_ROOT"
-$PYTHON -m pytest -xvs tests/colocate/test_colocate_tiny.py
+PYTEST_RC=0
+$PYTHON -m pytest -xvs "${TEST_FILES[@]}" || PYTEST_RC=$?
 
-banner "Smoke run complete."
+banner "Smoke run complete (pytest exit=$PYTEST_RC)."
+exit "$PYTEST_RC"

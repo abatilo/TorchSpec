@@ -979,6 +979,12 @@ exercised by a 1×GPU + 1-trainer + 1-engine + tiny-model topology.
 
 **Solution: `tests/colocate/test_colocate_tiny.py` + `configs/colocate_qwen0p6b_tiny.yaml` + `scripts/colocate/run_smoke_host.sh`.**
 
+> Self-contained agent handoff: see
+> [`cheap_host_test_plan.md`](cheap_host_test_plan.md). It includes the
+> RunPod / Vast.ai recipes, the cost-tier matrix, the success-criteria
+> checklist, and a failure-mode table the next agent can pattern-match
+> against without re-deriving everything.
+
 The tiny variant runs on a single 24 GB consumer- or L40S-class GPU
 with Qwen3-0.6B-Base, exercises the full colocate sync loop, and
 gates on `has_n_gpus(1) AND mps_works()` instead of `has_h100_quad()`.
