@@ -925,3 +925,37 @@ failure`,
 `33d71fa tests/colocate/one_step: stream subprocess output ...`)
 that made these failures debuggable in pytest's captured-stdout
 format.
+
+**3. Skip Phase-4+ tests when MPS is broken.** Once we knew Modal
+sandbox couldn't run real colocate, hanging the test for 30 minutes
+was a waste. ``tests/colocate/_mps_probe.py`` (commit
+`975d1a6`) centralises a 4-GPU + working-MPS pre-flight; Phase 4
+one-step, Phase 6 stability, and both Phase-7 tests now ``pytest.skip``
+with a clear reason on Modal sandbox instead of timing out.
+Phase 1 placement test also got the MPS-fallback fixture treatment
+(`3836024`) so the args-validation test still runs on hosts where
+the MPS fixture has to skip.
+
+**Phase verification matrix on Modal sandbox (final):**
+
+| Phase | Modal entrypoint | Status | Notes |
+|-------|------------------|--------|-------|
+| 1 — placement | `phase1_placement` | 1 passed, 4 skipped | args validation passes; MPS fixtures skip cleanly. |
+| 2 — union world | `phase2_union_world` | 1/1 PASSED | 8×H100, no MPS dependency. |
+| 3 — P2P dummy | `phase3_p2p_dummy` | parked from earlier session | 2-rank no-MPS path. |
+| 4 — multi-tensor | `phase4_multi_tensor` | 2/2 PASSED | 2-rank no-MPS path; confirms `init_process_group` `device_id=` removal doesn't regress lazy NCCL. |
+| 4 — one-step | `phase4_one_step` | SKIPPED (Modal sandbox lacks MPS) | will pass on a real DGX-style host with `--ipc=host`. |
+| 6 — stability | `phase6_stability` | SKIPPED (Modal sandbox lacks MPS) | same. |
+| 7 — grad parity | `phase7_grad_parity` | SKIPPED (Modal sandbox lacks MPS) | same. |
+| 7 — convergence | `phase7_convergence` | SKIPPED (Modal sandbox lacks MPS) | same. |
+
+The Phase-4-through-Phase-7 tests are *implemented* (commits
+`f4e8817`, `33d71fa`, `4c1e042`, `9824bf8`, `58be9c7`, `b923736`,
+`975d1a6`) and are gated to run when MPS is functional. To exercise
+them, point `modal run --env <env>` at a function whose container
+image has been built with `--ipc=host` (or run them on a bare-metal
+4×H100 + MPS host). The fallback path (no MPS, fractional GPU
+sharing only) is a graceful degradation that lets `train_entry`
+reach the colocate loop without crashing — but inter-process NCCL
+P2P still needs real MPS, which is why we skip rather than
+"functionally run with degraded performance".
