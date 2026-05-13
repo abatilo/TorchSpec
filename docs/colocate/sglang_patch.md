@@ -4,6 +4,14 @@
 > set of changes inside sglang itself. This doc enumerates the exact
 > patch surface so a human submitter can drive the upstream PR (or, in
 > the meantime, maintain a fork).
+>
+> **The patch now lives in this repo as
+> [`patches/sglang/v0.5.8.post1/colocate.patch`](../../patches/sglang/v0.5.8.post1/colocate.patch).**
+> It is applied on top of the existing `sglang.patch` (the disagg
+> patch). The Modal smoke image (`scripts/modal/modal_colocate_smoke.py`)
+> applies both in order. The pseudocode in the rest of this document
+> still describes what the patch does and serves as the upstream-PR
+> spec — see `colocate.patch` for the actual diff.
 
 ## Motivation
 

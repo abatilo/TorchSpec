@@ -157,8 +157,16 @@ sglang_image = (
         f"cd {SGLANG_DIR} && git checkout {SGLANG_COMMIT} && git reset --hard HEAD",
         f"cd {REPO_DIR} && pip install -e '_sglang/python[all]'",
         f"rm -f {SGLANG_DIR}/python/sglang/srt/speculative/spec_training_info.py",
-        f"cd {SGLANG_DIR} && git apply "
+        f"cd {SGLANG_DIR} && git apply --recount "
         f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/sglang.patch || true",
+        # Phase 4 colocate (NCCL) patch — applied on top of the disagg
+        # patch above. Adds the union-world join in distributed init
+        # and routes the spec_training writer to NcclHiddenStatesConnector
+        # when TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl is set. Disagg
+        # runs unaffected (the patch is structurally a no-op when the
+        # env sentinel is unset).
+        f"cd {SGLANG_DIR} && git apply --recount "
+        f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/colocate.patch",
     )
     # Overlay local working tree on top of the pinned commit.
     .add_local_dir("torchspec", f"{REPO_DIR}/torchspec", copy=True)

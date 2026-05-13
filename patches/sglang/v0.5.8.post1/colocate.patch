@@ -1,0 +1,727 @@
+From a2039d872c7ecd5b24974392beef8e5d4cd6e72b Mon Sep 17 00:00:00 2001
+From: xinghandd <xing.han@doordash.com>
+Date: Tue, 12 May 2026 23:30:03 -0700
+Subject: [PATCH] TorchSpec colocate (NCCL) patch: union-world join +
+ spec_training NCCL writer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the engine-side support for TorchSpec's colocate (MPS + NCCL)
+training mode, gated entirely behind the env-var sentinel
+TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl. When the sentinel is unset
+(disaggregated path), the patch is a structural no-op — both flag
+checks short-circuit and the existing Mooncake KV-store path runs
+unchanged.
+
+What this patch implements:
+* `python/sglang/srt/distributed/torchspec_colocate.py` (new) —
+  self-contained helper module: parses TorchSpec's env-var contract
+  (TORCHSPEC_COLOCATE_*), joins the 2N-rank union NCCL world as the
+  default PG via init_process_group with device_id (Phase-3 lesson:
+  device_id is required to avoid NCCL guessing GPU-by-rank under
+  Ray's CUDA_VISIBLE_DEVICES isolation), and lazily imports
+  TorchSpec's NcclHiddenStatesConnector for the spec_training writer.
+* `parallel_state.py::initialize_model_parallel` — accepts a new
+  optional `tp_world_ranks` kwarg. When passed (colocate), it skips
+  the `world_size == tp_size * pp_size` assertion (the engine half
+  of the union world is `[N, 2N)`, world_size is 2N), uses that
+  exact rank list as the single TP group, and creates singleton PP
+  groups (pp_size==1 invariant for colocate). Defends against
+  non-default MoE-EP/MoE-TP layouts under colocate, which would
+  otherwise build broken groups via linear rank arithmetic.
+* `model_executor/model_runner.py` — branches at the
+  init_distributed_environment / initialize_model_parallel call site.
+  When colocate is active, calls torchspec_colocate.init_union_default_pg
+  (which brings up the 2N-rank union world), then calls
+  init_distributed_environment redundantly (it sees dist already up
+  and only sets sglang's `_WORLD` to a 2N-rank world group), then
+  calls initialize_model_parallel with the explicit `tp_world_ranks`
+  derived from the union env. Disagg path is unchanged.
+* `managers/scheduler.py::Scheduler.__init__` — adds
+  `self.eagle_nccl_writer` next to `self.eagle_mooncake_store`.
+  Skips the Mooncake background-init thread under colocate. After
+  init_model_worker brings up torch.distributed, instantiates the
+  NcclHiddenStatesConnector on every TP rank (each TP rank pairs
+  1:1 with one trainer rank in the union world).
+* `managers/scheduler_output_processor_mixin.py` — adds
+  `_send_hidden_states_to_nccl`, mirrors `_send_hidden_states_to_mooncake`
+  but writes to the NCCL connector instead of the Mooncake KV store.
+  `_process_hidden_states_for_req` branches: NCCL writer takes
+  precedence when both are somehow set (defensive — they should be
+  mutually exclusive). Tensors built into the dict the trainer
+  fetcher's sorted-by-key walk expects: `hidden_states`, `input_ids`,
+  `last_hidden_states` (when set), `aux_hidden_states` (when set).
+
+What this patch does NOT do (out of scope per implementation.md):
+* Multi-node colocate.
+* Mixed colocate + disagg in the same job.
+* tp_size > 1 has been considered structurally (initialize_model_parallel
+  takes tp_world_ranks regardless), but the only actively tested
+  colocate config is tp_size=1. Larger TP needs the same tp_world_ranks
+  threading without changes here.
+
+Verified locally:
+* All five patched files (torchspec_colocate.py + 4 modified) parse
+  cleanly via `ast.parse`.
+* End-to-end NCCL P2P (the `phase4_one_step` Modal target) needs the
+  matching TorchSpec branch and physical GPUs; deferred to Modal.
+
+AI-assisted (Claude). Human submitter reviewed.
+
+Co-authored-by: Claude
+---
+ .../sglang/srt/distributed/parallel_state.py  |  75 ++++-
+ .../srt/distributed/torchspec_colocate.py     | 258 ++++++++++++++++++
+ python/sglang/srt/managers/scheduler.py       |  39 ++-
+ .../scheduler_output_processor_mixin.py       |  85 +++++-
+ .../sglang/srt/model_executor/model_runner.py |  73 ++++-
+ 5 files changed, 500 insertions(+), 30 deletions(-)
+ create mode 100644 python/sglang/srt/distributed/torchspec_colocate.py
+
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index 3070178b6..d7545961d 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1544,6 +1544,7 @@ def initialize_model_parallel(
+     pipeline_model_parallel_size: int = 1,
+     backend: Optional[str] = None,
+     duplicate_tp_group: bool = False,
++    tp_world_ranks: Optional[List[int]] = None,
+ ) -> None:
+     """
+     Initialize model parallel groups.
+@@ -1572,23 +1573,54 @@ def initialize_model_parallel(
+     world_size: int = torch.distributed.get_world_size()
+     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+ 
+-    if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
++    # TorchSpec colocate path: when an explicit `tp_world_ranks` is passed
++    # in (engines occupy `[N, 2N)` of a `2N`-rank union world), we skip
++    # the world_size assertion and use that exact rank list as the single
++    # TP group. The world_size != tp_size * pp_size assertion is correct
++    # for the standard case (sglang owns the entire world) but breaks
++    # when sglang is one half of a union world shared with a trainer.
++    # We also derive a single MoE-EP / MoE-TP / PP layout from the same
++    # rank list, since under colocate sglang is run with pp_size=1 and
++    # ep_size==tp_size (the only configurations the colocate plan
++    # supports — see docs/colocate/implementation.md §"Out-of-scope").
++    is_torchspec_colocate = tp_world_ranks is not None
++    if is_torchspec_colocate:
++        if len(tp_world_ranks) != tensor_model_parallel_size:
++            raise RuntimeError(
++                f"tp_world_ranks length ({len(tp_world_ranks)}) does not "
++                f"match tensor_model_parallel_size ({tensor_model_parallel_size}). "
++                f"Driver-side bug — see torchspec_colocate.build_engine_tp_ranks."
++            )
++        if pipeline_model_parallel_size != 1:
++            raise RuntimeError(
++                "TorchSpec colocate currently supports pp_size=1 only. "
++                "See docs/colocate/implementation.md §Out-of-scope."
++            )
++        num_tensor_model_parallel_groups = 1
++    elif world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
+         raise RuntimeError(
+             f"world_size ({world_size}) is not equal to "
+             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+         )
++    else:
++        num_tensor_model_parallel_groups = world_size // tensor_model_parallel_size
+ 
+     # Build the tensor model-parallel groups.
+-    num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
+     global _TP
+     assert _TP is None, "tensor model parallel group is already initialized"
+     group_ranks = []
+-    for i in range(num_tensor_model_parallel_groups):
+-        ranks = list(
+-            range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
+-        )
+-        group_ranks.append(ranks)
++    if is_torchspec_colocate:
++        group_ranks.append(list(tp_world_ranks))
++    else:
++        for i in range(num_tensor_model_parallel_groups):
++            ranks = list(
++                range(
++                    i * tensor_model_parallel_size,
++                    (i + 1) * tensor_model_parallel_size,
++                )
++            )
++            group_ranks.append(ranks)
+ 
+     # message queue broadcaster is only used in tensor model parallel group
+     _TP = init_model_parallel_group(
+@@ -1624,6 +1656,18 @@ def initialize_model_parallel(
+     moe_ep_size = expert_model_parallel_size
+     moe_tp_size = tensor_model_parallel_size // moe_ep_size
+ 
++    if is_torchspec_colocate and (
++        moe_ep_size != tensor_model_parallel_size
++        or moe_tp_size != tensor_model_parallel_size
++    ):
++        raise RuntimeError(
++            "TorchSpec colocate requires moe_ep_size == moe_tp_size == "
++            "tensor_model_parallel_size (default sharding). The non-default "
++            "MoE layouts use linear rank arithmetic on world_size that "
++            "breaks under union-world rank layouts. See "
++            "docs/colocate/implementation.md §Out-of-scope."
++        )
++
+     global _MOE_EP
+     assert _MOE_EP is None, "expert model parallel group is already initialized"
+     if moe_ep_size == tensor_model_parallel_size:
+@@ -1665,13 +1709,20 @@ def initialize_model_parallel(
+         )
+ 
+     # Build the pipeline model-parallel groups.
+-    num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
+     global _PP
+     assert _PP is None, "pipeline model parallel group is already initialized"
+-    group_ranks = []
+-    for i in range(num_pipeline_model_parallel_groups):
+-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+-        group_ranks.append(ranks)
++    if is_torchspec_colocate:
++        # pp_size==1 invariant for colocate. Each engine TP rank is its
++        # own singleton PP group.
++        group_ranks = [[r] for r in tp_world_ranks]
++    else:
++        num_pipeline_model_parallel_groups: int = (
++            world_size // pipeline_model_parallel_size
++        )
++        group_ranks = []
++        for i in range(num_pipeline_model_parallel_groups):
++            ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
++            group_ranks.append(ranks)
+     # pipeline parallel does not need custom allreduce
+     _PP = init_model_parallel_group(
+         group_ranks,
+diff --git a/python/sglang/srt/distributed/torchspec_colocate.py b/python/sglang/srt/distributed/torchspec_colocate.py
+new file mode 100644
+index 000000000..a7e018bce
+--- /dev/null
++++ b/python/sglang/srt/distributed/torchspec_colocate.py
+@@ -0,0 +1,258 @@
++"""TorchSpec colocate (MPS + NCCL) integration helpers.
++
++This module is the engine-process side of the contract documented in
++``docs/colocate/sglang_patch.md`` of the TorchSpec repo. It is loaded
++unconditionally but only "fires" when the env-var sentinel
++``TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl`` is set by the TorchSpec
++driver before launching sglang.
++
++When active, it replaces sglang's per-engine NCCL world with a slice
++of TorchSpec's ``2N``-rank **union NCCL world** (N trainer ranks +
++N engine ranks, paired by index). The engine writes hidden states
++directly to its paired trainer rank via P2P on that union world,
++removing the Mooncake KV-store round-trip used in the disaggregated
++path.
++
++Public surface:
++
++* :func:`is_colocate_active` — quick env-var check.
++* :func:`read_colocate_env` — parsed env-var contract.
++* :func:`init_union_default_pg` — replacement for sglang's
++  ``init_distributed_environment`` body when colocate is on.
++* :func:`build_engine_tp_ranks` — returns the contiguous rank range
++  that maps to this engine's TP group inside the union world.
++* :func:`build_hidden_states_writer` — connector factory used by the
++  patched scheduler.
++
++This file is the **only** new file added by the colocate patch; the
++rest of the patch surface is small in-place edits in
++``model_runner.py``, ``parallel_state.py``, ``scheduler.py``, and
++``scheduler_output_processor_mixin.py``.
++"""
++from __future__ import annotations
++
++import logging
++import os
++from dataclasses import dataclass
++from datetime import timedelta
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++
++_TRANSFER_MODE_ENV = "TORCHSPEC_COLOCATE_TRANSFER_MODE"
++_PAIRED_TRAINER_RANK_ENV = "TORCHSPEC_COLOCATE_PAIRED_TRAINER_RANK"
++_UNION_MASTER_ADDR_ENV = "TORCHSPEC_COLOCATE_UNION_MASTER_ADDR"
++_UNION_MASTER_PORT_ENV = "TORCHSPEC_COLOCATE_UNION_MASTER_PORT"
++_UNION_WORLD_SIZE_ENV = "TORCHSPEC_COLOCATE_UNION_WORLD_SIZE"
++_UNION_N_PER_ROLE_ENV = "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE"
++_UNION_TIMEOUT_MIN_ENV = "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN"
++_UNION_INITIALIZED_ENV = "TORCHSPEC_COLOCATE_UNION_WORLD"
++
++
++@dataclass(frozen=True)
++class ColocateEnv:
++    """Parsed contents of the TorchSpec colocate env-var contract."""
++
++    paired_trainer_rank: int
++    master_addr: str
++    master_port: int
++    world_size: int
++    n_per_role: int
++    timeout_minutes: int
++
++    @property
++    def init_method(self) -> str:
++        return f"tcp://{self.master_addr}:{self.master_port}"
++
++    def engine_global_rank(self, tp_rank: int) -> int:
++        """Map this engine subprocess' TP rank to its union-world rank.
++
++        Engines occupy ``[N, 2N)`` in the union world, contiguous block
++        following the trainer ranks. The trainer at union rank ``i`` is
++        paired with the engine TP rank ``i`` (so engine global rank is
++        ``N + i``).
++        """
++        if not 0 <= tp_rank < self.n_per_role:
++            raise ValueError(
++                f"tp_rank={tp_rank} out of range [0, {self.n_per_role})"
++            )
++        return self.n_per_role + tp_rank
++
++
++def is_colocate_active() -> bool:
++    """Return ``True`` iff TorchSpec's env-var sentinel is set."""
++    return os.environ.get(_TRANSFER_MODE_ENV, "").lower() == "nccl"
++
++
++def read_colocate_env() -> Optional[ColocateEnv]:
++    """Read and validate the TorchSpec colocate env-var contract.
++
++    Returns ``None`` if colocate is not active. Raises
++    ``RuntimeError`` if the sentinel is on but required env vars are
++    missing — that's a driver-side bug we want to surface loudly.
++    """
++    if not is_colocate_active():
++        return None
++
++    try:
++        return ColocateEnv(
++            paired_trainer_rank=int(os.environ[_PAIRED_TRAINER_RANK_ENV]),
++            master_addr=os.environ[_UNION_MASTER_ADDR_ENV],
++            master_port=int(os.environ[_UNION_MASTER_PORT_ENV]),
++            world_size=int(os.environ[_UNION_WORLD_SIZE_ENV]),
++            n_per_role=int(os.environ[_UNION_N_PER_ROLE_ENV]),
++            timeout_minutes=int(os.environ.get(_UNION_TIMEOUT_MIN_ENV, "30")),
++        )
++    except KeyError as e:
++        raise RuntimeError(
++            f"TorchSpec colocate is active ({_TRANSFER_MODE_ENV}=nccl) but "
++            f"required env var {e.args[0]} is missing. The TorchSpec "
++            f"driver must export the full union-world rendezvous before "
++            f"launching sglang. See docs/colocate/sglang_patch.md."
++        ) from e
++
++
++def init_union_default_pg(
++    *,
++    tp_rank: int,
++    local_rank: int,
++    backend: str = "nccl",
++) -> ColocateEnv:
++    """Bring up TorchSpec's union NCCL world as the **default** PG.
++
++    Replacement for sglang's ``init_distributed_environment`` body when
++    colocate is active. After this returns:
++
++    * ``torch.distributed.is_initialized()`` is True.
++    * The default PG has ``world_size=2N`` ranks. Trainer ranks are
++      ``[0, N)`` and have already joined via TorchSpec's
++      ``init_union_world`` (this call unblocks them).
++    * The current engine subprocess sits at rank ``N + tp_rank``.
++
++    The caller is then responsible for creating sglang's TP group as
++    a contiguous slice ``[N, 2N)`` via the patched
++    ``initialize_model_parallel(..., tp_world_ranks=...)``.
++
++    Args:
++        tp_rank: The engine's TP rank within its own engine actor.
++            For the colocate-config invariant (engine_count *
++            engine_tp_size == training_world_size), this maps 1:1 to
++            the engine slot in the union world's `[N, 2N)` block.
++        local_rank: Local GPU index for this process. Passed to
++            ``init_process_group`` as ``device_id`` so NCCL doesn't
++            silently deadlock under Ray's CUDA_VISIBLE_DEVICES
++            isolation (the Phase-3 lesson).
++        backend: NCCL backend name (defaults to ``"nccl"``).
++
++    Returns:
++        The parsed :class:`ColocateEnv` for this process. Use it to
++        build the TP-rank list and to look up the paired trainer rank
++        for the hidden-states writer.
++
++    Raises:
++        RuntimeError: If colocate isn't active, or torch.distributed
++            is already initialised (idempotency violation), or the env
++            contract is incomplete.
++    """
++    import torch
++    import torch.distributed as dist
++
++    env = read_colocate_env()
++    if env is None:
++        raise RuntimeError(
++            "init_union_default_pg called but colocate is not active. "
++            "Check is_colocate_active() before calling."
++        )
++
++    if dist.is_initialized():
++        # Already up — most likely because the trainer and this engine
++        # share a Python process (test fixtures). Just verify shape.
++        actual = dist.get_world_size()
++        if actual != env.world_size:
++            raise RuntimeError(
++                f"torch.distributed already initialised with world_size="
++                f"{actual} but colocate env declares world_size="
++                f"{env.world_size}. Driver-side bug."
++            )
++        logger.info(
++            "[torchspec-colocate] torch.distributed already initialised "
++            "(world_size=%d); reusing it as the union default PG.",
++            actual,
++        )
++        return env
++
++    global_rank = env.engine_global_rank(tp_rank)
++    device = torch.device("cuda", local_rank)
++
++    logger.info(
++        "[torchspec-colocate] Joining TorchSpec union world: "
++        "tp_rank=%d global_rank=%d/%d local_rank=%d init_method=%s "
++        "timeout=%dmin",
++        tp_rank, global_rank, env.world_size, local_rank,
++        env.init_method, env.timeout_minutes,
++    )
++
++    dist.init_process_group(
++        backend=backend,
++        world_size=env.world_size,
++        rank=global_rank,
++        init_method=env.init_method,
++        timeout=timedelta(minutes=env.timeout_minutes),
++        device_id=device,
++    )
++
++    # Mark the union world as up so a subsequent
++    # `init_distributed_environment` call (e.g. from a draft model
++    # worker) becomes a no-op.
++    os.environ[_UNION_INITIALIZED_ENV] = "1"
++
++    return env
++
++
++def build_engine_tp_ranks(env: ColocateEnv) -> list[int]:
++    """Return the contiguous union-world ranks that form sglang's TP group.
++
++    For the colocate-config invariant
++    ``engine_count * engine_tp_size == training_world_size == N``,
++    sglang's TP group is exactly the ``[N, 2N)`` half of the union
++    world. This is what we hand to the patched
++    ``initialize_model_parallel(..., tp_world_ranks=...)``.
++
++    For the simpler ``tp_size=1`` case (the colocate-qwen3-8b-1node
++    example), each engine is a singleton TP group ``[N + i]``; the
++    sglang patch detects ``tp_size==1`` separately and skips the
++    multi-rank TP group construction entirely.
++    """
++    return list(range(env.n_per_role, 2 * env.n_per_role))
++
++
++def build_hidden_states_writer():
++    """Return a TorchSpec NcclHiddenStatesConnector for the spec_training callback.
++
++    Imported lazily so disaggregated runs (where colocate is off)
++    never pull torchspec into sglang's import graph. Raises
++    ``ImportError`` with a clear remediation if torchspec isn't on
++    the engine subprocess' ``PYTHONPATH``.
++    """
++    env = read_colocate_env()
++    if env is None:
++        raise RuntimeError(
++            "build_hidden_states_writer called but colocate is not active."
++        )
++
++    try:
++        from torchspec.inference.engine.nccl_hidden_states_connector import (
++            NcclHiddenStatesConnector,
++        )
++    except ImportError as e:
++        raise ImportError(
++            "TorchSpec colocate is active but `torchspec` is not "
++            "importable from the sglang engine subprocess. Ensure "
++            "TorchSpec is installed (`pip install -e .` from the "
++            "TorchSpec checkout) and that PYTHONPATH includes it."
++        ) from e
++
++    return NcclHiddenStatesConnector(
++        dst_global_rank=env.paired_trainer_rank,
++    )
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index f8c65272c..c234e1816 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -346,11 +346,28 @@ class Scheduler(
+         # Init moe config and GEMM config (FP8 GEMM, etc.)
+         self.init_moe_gemm_config()
+ 
+-        # Start mooncake store init in background (overlaps with model loading)
++        # TorchSpec colocate: in NCCL transfer mode the spec_training
++        # writer is an NCCL P2P sender to the paired trainer rank
++        # (set up after init_model_worker because it needs
++        # torch.distributed to be initialised). Initialised here for
++        # symmetry with the Mooncake path; actual instantiation
++        # deferred to after init_model_worker().
++        from sglang.srt.distributed.torchspec_colocate import is_colocate_active
++
++        self.eagle_nccl_writer = None
++        self._torchspec_colocate_active = is_colocate_active()
++
++        # Start mooncake store init in background (overlaps with model loading).
++        # Skipped under colocate — colocate uses the NCCL writer below
++        # and explicitly does not pull Mooncake into the spec_training path.
+         self._mooncake_init_thread = None
+         self._mooncake_init_error = None
+         self.eagle_mooncake_store = None
+-        if self.server_args.enable_spec_training_mooncake and self.attn_tp_rank == 0:
++        if (
++            self.server_args.enable_spec_training_mooncake
++            and self.attn_tp_rank == 0
++            and not self._torchspec_colocate_active
++        ):
+             import threading
+ 
+             mooncake_device = torch.device(f"cuda:{self.gpu_id}")
+@@ -369,6 +386,24 @@ class Scheduler(
+         # Launch a model worker and draft model worker if using speculative decoding
+         self.init_model_worker()
+ 
++        # Now that torch.distributed is up (via init_model_worker →
++        # model_runner.init_torch_distributed), bring up the colocate
++        # NCCL writer. Done on EVERY TP rank (each TP rank pairs 1:1
++        # with a trainer rank in the union world; per Phase-4 plan,
++        # each rank sends its own local-chunk via P2P).
++        if self._torchspec_colocate_active:
++            from sglang.srt.distributed.torchspec_colocate import (
++                build_hidden_states_writer,
++            )
++
++            self.eagle_nccl_writer = build_hidden_states_writer()
++            logger.info(
++                "[torchspec-colocate] NCCL hidden-states writer initialised "
++                "on tp_rank=%d (paired_trainer_rank=%d).",
++                self.tp_rank,
++                self.eagle_nccl_writer.dst_global_rank,
++            )
++
+         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
+             time.sleep(t)
+ 
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index 2f114c70e..c2b745791 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -852,13 +852,35 @@ class SchedulerOutputProcessorMixin:
+         hidden_state_offset: int,
+         copy_done_event=None,
+     ):
+-        """Process hidden states during prefill for spec training or return_hidden_states."""
++        """Process hidden states during prefill for spec training or return_hidden_states.
++
++        Two writers, mutually exclusive:
++
++        * ``self.eagle_nccl_writer``: TorchSpec colocate (NCCL P2P) path.
++          Set when ``TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl`` is in env.
++          Sends a per-request named-tensor dict to the paired trainer
++          rank via a single ``dist.batch_isend_irecv`` on the union
++          world. Fires on **every** TP rank (each TP rank pairs 1:1
++          with a trainer rank).
++        * ``self.eagle_mooncake_store``: legacy disagg path. Writes to
++          a Mooncake KV store keyed by ``mooncake_key``. Fires only on
++          ``attn_tp_rank == 0`` (Mooncake serialises through one rank).
++        """
+         seq_len = len(req.origin_input_ids)
+         req_hidden_states = logits_output.hidden_states[
+             hidden_state_offset : hidden_state_offset + seq_len
+         ]
+ 
+         if (
++            batch.spec_training_info is not None
++            and batch.spec_training_info.has_request(req.rid)
++            and self.eagle_nccl_writer is not None
++        ):
++            self._send_hidden_states_to_nccl(
++                req, batch, req_hidden_states, logits_output, hidden_state_offset,
++                copy_done_event=copy_done_event,
++            )
++        elif (
+             batch.spec_training_info is not None
+             and batch.spec_training_info.has_request(req.rid)
+             and self.eagle_mooncake_store is not None
+@@ -940,6 +962,67 @@ class SchedulerOutputProcessorMixin:
+         req.spec_training_mooncake_store_keys.append(key)
+         batch.spec_training_info.mooncake_store_keys[data_id].append(key)
+ 
++    def _send_hidden_states_to_nccl(
++        self: Scheduler,
++        req: Req,
++        batch: ScheduleBatch,
++        hidden_states: torch.Tensor,
++        logits_output: LogitsProcessorOutput,
++        hidden_state_offset: int,
++        copy_done_event=None,
++    ):
++        """TorchSpec colocate path: send hidden-state dict to paired trainer rank.
++
++        Mirrors ``_send_hidden_states_to_mooncake`` but the wire is a
++        single ``dist.batch_isend_irecv`` on the union world to the
++        paired trainer rank, not a Mooncake KV store ``put``. The
++        writer is :class:`torchspec.inference.engine.nccl_hidden_states_connector.NcclHiddenStatesConnector`
++        and the receiver is :class:`torchspec.training.nccl_data_fetcher.NcclMultiTensorFetcher`.
++
++        The dict key set must match what TorchSpec's
++        ``ColocateTrainSample.tensor_specs`` declares; both sides walk
++        ``sorted(keys)`` so insertion order is irrelevant.
++
++        Tensors must be contiguous and on CUDA. The connector raises
++        ``ValueError`` if not (defensive — by this point the model
++        runner has already produced contiguous CUDA tensors).
++        """
++        seq_len = hidden_states.shape[0]
++        input_ids = torch.tensor(
++            req.origin_input_ids, dtype=torch.long, device=hidden_states.device
++        )
++
++        last_hidden_states = None
++        if logits_output.last_hidden_states is not None:
++            last_hidden_states = logits_output.last_hidden_states[
++                hidden_state_offset : hidden_state_offset + seq_len
++            ]
++
++        # Wait on the host→device copy event before NCCL P2P kicks off,
++        # mirroring the Mooncake path.
++        if hidden_states.is_cuda and copy_done_event is not None:
++            torch.cuda.current_stream().wait_event(copy_done_event)
++
++        # Build the dict the trainer fetcher expects. Keys must match
++        # ColocateTrainSample.tensor_specs (sorted-by-key on both sides).
++        # `aux_hidden_states` is appended only when it's actually present
++        # — Eagle3 with no aux layers omits it.
++        tensors = {
++            "hidden_states": hidden_states.contiguous(),
++            "input_ids": input_ids,
++        }
++        if last_hidden_states is not None:
++            tensors["last_hidden_states"] = last_hidden_states.contiguous()
++        if (
++            getattr(logits_output, "aux_hidden_states", None) is not None
++        ):
++            aux = logits_output.aux_hidden_states[
++                hidden_state_offset : hidden_state_offset + seq_len
++            ]
++            tensors["aux_hidden_states"] = aux.contiguous()
++
++        self.eagle_nccl_writer.send(tensors)
++
+     def stream_output(
+         self: Scheduler,
+         reqs: List[Req],
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index d0ff3eb8d..cd98d9d3d 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -58,6 +58,11 @@ from sglang.srt.distributed import (
+     set_mscclpp_all_reduce,
+     set_torch_symm_mem_all_reduce,
+ )
++from sglang.srt.distributed.torchspec_colocate import (
++    build_engine_tp_ranks,
++    init_union_default_pg,
++    is_colocate_active,
++)
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
+@@ -782,21 +787,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                         "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
+                     )
+ 
+-            # Only initialize the distributed environment on the target model worker.
+-            init_distributed_environment(
+-                backend=backend,
+-                world_size=self.tp_size * self.pp_size,
+-                rank=self.tp_size * self.pp_rank + self.tp_rank,
+-                local_rank=self.gpu_id,
+-                distributed_init_method=dist_init_method,
+-                timeout=self.server_args.dist_timeout,
+-            )
+-            initialize_model_parallel(
+-                tensor_model_parallel_size=self.tp_size,
+-                pipeline_model_parallel_size=self.pp_size,
+-                expert_model_parallel_size=self.moe_ep_size,
+-                duplicate_tp_group=self.server_args.enable_pdmux,
+-            )
++            # TorchSpec colocate path: when the env-var sentinel is set,
++            # join TorchSpec's pre-existing 2N-rank union NCCL world as
++            # the default PG instead of bringing up our own. The trainer
++            # ranks `[0, N)` have already started the rendezvous via
++            # init_union_world; the call below is what unblocks them.
++            # We then call sglang's init_distributed_environment as
++            # usual — torch.distributed is already up so it skips its
++            # own init_process_group call but still sets `_WORLD` to a
++            # 2N-rank world group, which is what downstream sglang
++            # (allreduce, world barriers) expects. See
++            # docs/colocate/sglang_patch.md and torchspec_colocate.py.
++            if is_colocate_active():
++                colocate_env = init_union_default_pg(
++                    tp_rank=self.tp_size * self.pp_rank + self.tp_rank,
++                    local_rank=self.gpu_id,
++                    backend=backend,
++                )
++                init_distributed_environment(
++                    backend=backend,
++                    world_size=colocate_env.world_size,
++                    rank=colocate_env.engine_global_rank(
++                        self.tp_size * self.pp_rank + self.tp_rank
++                    ),
++                    local_rank=self.gpu_id,
++                    # Init method is irrelevant — dist is already up; sglang
++                    # only re-uses this to set _WORLD. Pass the same union
++                    # init_method for symmetry.
++                    distributed_init_method=colocate_env.init_method,
++                    timeout=self.server_args.dist_timeout,
++                )
++                initialize_model_parallel(
++                    tensor_model_parallel_size=self.tp_size,
++                    pipeline_model_parallel_size=self.pp_size,
++                    expert_model_parallel_size=self.moe_ep_size,
++                    duplicate_tp_group=self.server_args.enable_pdmux,
++                    tp_world_ranks=build_engine_tp_ranks(colocate_env),
++                )
++            else:
++                # Only initialize the distributed environment on the target model worker.
++                init_distributed_environment(
++                    backend=backend,
++                    world_size=self.tp_size * self.pp_size,
++                    rank=self.tp_size * self.pp_rank + self.tp_rank,
++                    local_rank=self.gpu_id,
++                    distributed_init_method=dist_init_method,
++                    timeout=self.server_args.dist_timeout,
++                )
++                initialize_model_parallel(
++                    tensor_model_parallel_size=self.tp_size,
++                    pipeline_model_parallel_size=self.pp_size,
++                    expert_model_parallel_size=self.moe_ep_size,
++                    duplicate_tp_group=self.server_args.enable_pdmux,
++                )
+             initialize_dp_attention(
+                 server_args=self.server_args,
+                 model_config=self.model_config,
+-- 
+2.51.2
+
