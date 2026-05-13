@@ -52,15 +52,7 @@ pytestmark = [
 ]
 
 
-def _has_h100_quad() -> bool:
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL, text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-    return len([g for g in out.splitlines() if g.strip()]) >= 4
+from tests.colocate._mps_probe import has_h100_quad, mps_works
 
 
 def _extract_peak_alloc(log: str) -> dict[int, float]:
@@ -83,8 +75,16 @@ def _extract_peak_alloc(log: str) -> dict[int, float]:
 
 
 @pytest.mark.skipif(
-    not _has_h100_quad(),
+    not has_h100_quad(),
     reason="Phase 6 stability requires >=4 GPUs.",
+)
+@pytest.mark.skipif(
+    not mps_works(),
+    reason=(
+        "Phase 6 stability requires NVIDIA MPS support (skipped on hosts "
+        "where MPS server reports 'operation not supported'; see "
+        "tests/colocate/_mps_probe.py for details)."
+    ),
 )
 def test_phase6_peak_alloc_flatness():
     """Run NUM_STEPS colocate steps; peak-alloc must stay flat ±5 %."""

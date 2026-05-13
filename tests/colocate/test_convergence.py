@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.colocate._mps_probe import has_h100_quad, mps_works
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 NUM_STEPS = int(os.environ.get("PHASE7_CONVERGE_STEPS", "50"))
@@ -37,17 +39,6 @@ pytestmark = [
     pytest.mark.slow,
     pytest.mark.timeout(60 * 60),
 ]
-
-
-def _has_h100_quad() -> bool:
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL, text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-    return len([g for g in out.splitlines() if g.strip()]) >= 4
 
 
 def _losses_from_log(log: str) -> list[tuple[int, float]]:
@@ -66,8 +57,15 @@ def _losses_from_log(log: str) -> list[tuple[int, float]]:
 
 
 @pytest.mark.skipif(
-    not _has_h100_quad(),
+    not has_h100_quad(),
     reason="Phase-7 convergence requires >=4 GPUs.",
+)
+@pytest.mark.skipif(
+    not mps_works(),
+    reason=(
+        "Phase-7 convergence needs the colocate path to actually run, "
+        "which needs working NVIDIA MPS (see tests/colocate/_mps_probe.py)."
+    ),
 )
 def test_phase7_convergence_loss_decreases():
     """After ``NUM_STEPS`` colocate steps the average late-window loss

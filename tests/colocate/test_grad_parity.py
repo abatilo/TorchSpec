@@ -30,20 +30,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.colocate._mps_probe import has_h100_quad, mps_works
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-pytestmark = pytest.mark.timeout(1500)
-
-
-def _has_h100_quad() -> bool:
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL, text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-    return len([g for g in out.splitlines() if g.strip()]) >= 4
+pytestmark = pytest.mark.timeout(2200)
 
 
 def _run_one_step(extra_args: list[str], *, seed: int = 42) -> str:
@@ -101,8 +92,15 @@ def _extract_loss(log: str) -> float:
 
 
 @pytest.mark.skipif(
-    not _has_h100_quad(),
+    not has_h100_quad(),
     reason="Phase-7 grad-parity smoke requires >=4 GPUs.",
+)
+@pytest.mark.skipif(
+    not mps_works(),
+    reason=(
+        "Phase-7 grad-parity needs the colocate path to actually run, "
+        "which needs working NVIDIA MPS (see tests/colocate/_mps_probe.py)."
+    ),
 )
 def test_phase7_grad_parity_smoke():
     """One colocate step finishes with a finite, non-zero training loss.

@@ -41,25 +41,24 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(2000)
 
 
-def _has_h100_quad() -> bool:
-    """Detect whether we're on a Modal H100:4 (or a dev box with 4+ GPUs)."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-    gpus = [g.strip() for g in out.splitlines() if g.strip()]
-    return len(gpus) >= 4
+from tests.colocate._mps_probe import has_h100_quad, mps_works
 
 
 @pytest.mark.skipif(
-    not _has_h100_quad(),
+    not has_h100_quad(),
     reason=(
         "Phase-4 one-step requires >=4 GPUs (Qwen3-8B with 4 trainers + "
         "4 engines colocated via MPS)."
+    ),
+)
+@pytest.mark.skipif(
+    not mps_works(),
+    reason=(
+        "Phase-4 one-step requires NVIDIA MPS support (the colocate path "
+        "shares one GPU between trainer + engine and inter-process NCCL P2P "
+        "needs MPS). On Modal sandbox / containers without --ipc=host, "
+        "MPS server fails with 'operation not supported' and the rendezvous "
+        "hangs; skip rather than burn 30 minutes of compute on a doomed run."
     ),
 )
 def test_phase4_one_step_completes_end_to_end(tmp_path: Path):
