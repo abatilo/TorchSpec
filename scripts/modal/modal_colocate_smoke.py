@@ -152,6 +152,9 @@ base_image = (
 
 sglang_image = (
     base_image
+    # Layer 1: clone sglang at the pinned commit, install editable, and
+    # apply the existing disagg patch (which has been part of the
+    # pinned TorchSpec commit since before this branch).
     .run_commands(
         f"git clone https://github.com/sgl-project/sglang.git {SGLANG_DIR}",
         f"cd {SGLANG_DIR} && git checkout {SGLANG_COMMIT} && git reset --hard HEAD",
@@ -159,21 +162,25 @@ sglang_image = (
         f"rm -f {SGLANG_DIR}/python/sglang/srt/speculative/spec_training_info.py",
         f"cd {SGLANG_DIR} && git apply --recount "
         f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/sglang.patch || true",
-        # Phase 4 colocate (NCCL) patch — applied on top of the disagg
-        # patch above. Adds the union-world join in distributed init
-        # and routes the spec_training writer to NcclHiddenStatesConnector
-        # when TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl is set. Disagg
-        # runs unaffected (the patch is structurally a no-op when the
-        # env sentinel is unset).
-        f"cd {SGLANG_DIR} && git apply --recount "
-        f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/colocate.patch",
     )
-    # Overlay local working tree on top of the pinned commit.
+    # Layer 2: overlay the local working tree (so iteration on the
+    # colocate code or patch doesn't require rebuilding the heavy
+    # base+disagg layers above). `patches/` overlay brings in the new
+    # `colocate.patch` file that may not exist in the pinned commit.
     .add_local_dir("torchspec", f"{REPO_DIR}/torchspec", copy=True)
     .add_local_dir("tests", f"{REPO_DIR}/tests", copy=True)
     .add_local_dir("patches", f"{REPO_DIR}/patches", copy=True)
     .add_local_dir("configs", f"{REPO_DIR}/configs", copy=True)
     .add_local_dir("scripts/tools", f"{REPO_DIR}/scripts/tools", copy=True)
+    # Layer 3: apply the Phase-4 colocate (NCCL) patch from the
+    # overlaid local patches/ directory. Layered AFTER the overlay so
+    # patch iteration only invalidates this thin layer's cache.
+    # Disagg runs are unaffected — the patch is structurally a no-op
+    # when TORCHSPEC_COLOCATE_TRANSFER_MODE is unset.
+    .run_commands(
+        f"cd {SGLANG_DIR} && git apply --recount "
+        f"{REPO_DIR}/patches/sglang/{SGLANG_PATCH_VERSION}/colocate.patch",
+    )
 )
 
 
@@ -455,6 +462,71 @@ def _run_probe():
         print("  sglang OK")
     except Exception as e:
         print(f"  sglang import failed: {e}")
+        return
+
+    # ---------------------------------------------------------------
+    # colocate.patch surface verification — these checks fail loudly
+    # if the layered patch did not apply during image build.
+    # ---------------------------------------------------------------
+    print("\n  --- colocate.patch surface ---")
+    import importlib
+    import inspect
+    import os
+
+    tc = importlib.import_module("sglang.srt.distributed.torchspec_colocate")
+    print(f"  helper module: {tc.__file__}")
+    assert tc.is_colocate_active() is False, (
+        "is_colocate_active() should be False with no env vars set"
+    )
+
+    os.environ["TORCHSPEC_COLOCATE_TRANSFER_MODE"] = "nccl"
+    os.environ["TORCHSPEC_COLOCATE_PAIRED_TRAINER_RANK"] = "0"
+    os.environ["TORCHSPEC_COLOCATE_UNION_MASTER_ADDR"] = "127.0.0.1"
+    os.environ["TORCHSPEC_COLOCATE_UNION_MASTER_PORT"] = "12345"
+    os.environ["TORCHSPEC_COLOCATE_UNION_WORLD_SIZE"] = "8"
+    os.environ["TORCHSPEC_COLOCATE_UNION_N_PER_ROLE"] = "4"
+    env = tc.read_colocate_env()
+    print(
+        f"  read_colocate_env: world_size={env.world_size} "
+        f"n_per_role={env.n_per_role} "
+        f"engine_global_rank(0)={env.engine_global_rank(0)} "
+        f"engine_global_rank(3)={env.engine_global_rank(3)}"
+    )
+    assert env.engine_global_rank(0) == 4
+    assert env.engine_global_rank(3) == 7
+    assert tc.build_engine_tp_ranks(env) == [4, 5, 6, 7]
+    print("  helper round-trip OK (4 trainer + 4 engine union world)")
+
+    from sglang.srt.distributed import parallel_state as ps
+
+    sig = inspect.signature(ps.initialize_model_parallel)
+    assert "tp_world_ranks" in sig.parameters, (
+        "tp_world_ranks kwarg missing — colocate.patch did not patch parallel_state.py"
+    )
+    print(
+        f"  parallel_state.initialize_model_parallel: tp_world_ranks kwarg present "
+        f"(params={list(sig.parameters.keys())})"
+    )
+
+    from sglang.srt.managers import scheduler_output_processor_mixin as som
+
+    assert hasattr(
+        som.SchedulerOutputProcessorMixin, "_send_hidden_states_to_nccl"
+    ), "_send_hidden_states_to_nccl missing — output processor mixin not patched"
+    print("  scheduler_output_processor_mixin._send_hidden_states_to_nccl present")
+
+    from sglang.srt.managers import scheduler as sc
+
+    src = inspect.getsource(sc.Scheduler.__init__)
+    assert "eagle_nccl_writer" in src, (
+        "eagle_nccl_writer init missing — scheduler.py not patched"
+    )
+    assert "is_colocate_active" in src or "torchspec_colocate" in src, (
+        "torchspec_colocate import missing in Scheduler.__init__"
+    )
+    print("  scheduler.Scheduler.__init__ wires eagle_nccl_writer + colocate gate")
+
+    print("\n  *** colocate.patch surface OK ***")
 
 
 @app.local_entrypoint()

@@ -22,7 +22,7 @@
 | 1 | Placement: 1:1 bundle pairing + MPS env | ✅ | Yes (4×H100) | 5/5 placement tests pass on Modal |
 | 2 | Union NCCL world (no transfer yet) | 🟡 | Yes (8×H100) | helper + 8-rank smoke test pass; trainer/engine wire-up + sglang patch deferred to Phase 4 |
 | 3 | NCCL P2P data plane (dummy tensors) | ✅ | Yes (2×H100) | 3/3 P2P dummy tests pass on Modal in 137 s; scaled down from plan's 4-GPU MPS topology — see deviations |
-| 4 | Real hidden-state hook in sglang | 🟢 | Yes (2×H100) | TorchSpec-side library + wiring complete; multi-tensor round-trip Modal test green; full one-step blocked on upstream sglang patch (surface documented in [`sglang_patch.md`](sglang_patch.md)) |
+| 4 | Real hidden-state hook in sglang | 🟢 | Yes (2×H100) | TorchSpec-side library + wiring complete; multi-tensor round-trip Modal test green; sglang patch landed locally + applied inside Modal image build (4/4 patch-surface assertions verified inside the container, see [Modal patch-surface verification](#modal-patch-surface-verification-2026-05-13)). Full one-step still parked behind the sync-loop body (Phase-5 `NotImplementedError`). |
 | 5 | Controller trim & loop integration | 🟢 | Yes (4×H100) | Mooncake-free `setup_colocate_training_with_engines` + `train_entry` branch landed; Phase-5 unit tests (`test_phase5_no_mooncake.py`) green; sync loop body raises `NotImplementedError` until upstream sglang patch lands |
 | 6 | Memory caps, MPS hygiene, stability | 🟢 | Yes (4×H100) | init-order fence + peak-alloc profiler metric + MPS daemon `atexit` cleanup landed; `test_stability.py` skeleton skipped pending upstream sglang patch |
 | 7 | Numeric parity & convergence | 🟢 | Yes (4–8×H100) | `test_grad_parity.py` + `test_convergence.py` skeletons landed (skipped pending upstream sglang patch) |
@@ -50,6 +50,56 @@ but the host driver is CUDA 13.0 and PyTorch self-reports `cu128`. Today
 this works because the wheels ship their own CUDA runtime, but bumping the
 base image to `nvidia/cuda:12.8.0-devel` would remove the version drift.
 Not blocking; will batch with Phase 8 docs.
+
+---
+
+## Modal patch-surface verification (2026-05-13)
+
+After landing the sglang colocate patch locally and copying it into
+`patches/sglang/v0.5.8.post1/colocate.patch`, the `sglang_image` build
+recipe was restructured into three layers so patch iteration only
+invalidates a thin top layer:
+
+1. Clone sglang at the pinned commit, `pip install -e`, apply the existing
+   disagg `sglang.patch` from the cloned (pinned) TorchSpec repo.
+2. Overlay the local working tree (`add_local_dir(..., copy=True)` for
+   `torchspec/`, `tests/`, `patches/`, `configs/`, `scripts/tools/`).
+3. Apply `colocate.patch` from the **overlaid** `patches/` directory.
+
+This avoids the cache-miss fallout from rebuilding the heavy base+disagg
+layers every time the colocate patch changes.
+
+`probe` was extended to assert the four patch-surface properties inside
+the live container, so any future image build that fails to apply the
+patch will surface immediately (rather than only at e2e training time):
+
+- `sglang.srt.distributed.torchspec_colocate` is importable and the
+  `read_colocate_env`/`engine_global_rank`/`build_engine_tp_ranks`
+  round-trip works.
+- `parallel_state.initialize_model_parallel` exposes the new
+  `tp_world_ranks` kwarg.
+- `scheduler_output_processor_mixin._send_hidden_states_to_nccl` exists.
+- `scheduler.Scheduler.__init__` references `eagle_nccl_writer` and the
+  colocate active-check.
+
+| Modal entry point      | GPU shape | Wall-clock | Result |
+|------------------------|-----------|------------|--------|
+| `probe` (with patch surface checks) | `H100:1` | 26 s | 4/4 patch-surface assertions pass |
+| `phase1_placement`     | `H100:4`  | 18 s tests / 40 s wall | 5/5 |
+| `phase3_p2p_dummy`     | `H100:2`  | 128 s tests / 150 s wall | 3/3 |
+| `phase4_multi_tensor`  | `H100:2`  | 39 s tests / 59 s wall | 2/2 |
+
+App URLs: `ap-EdpzPDk3VU3ndtq5jIGxwz` (probe), `ap-MqvPg9x7FtrF6lR21dn6zk`
+(phase1), `ap-ym0ktx5beEi3nFtga2C3Ca` (phase3), `ap-DgaFyiPd3sb9EZmcPfpPY8`
+(phase4_multi_tensor) — all under the `doordash/sandbox` Modal env.
+
+**Result:** the colocate patch is verified to apply cleanly inside the
+Modal image, the patch surface is verified at runtime, and none of the
+previously-green smoke tests regressed (the patch is a structural no-op
+when `TORCHSPEC_COLOCATE_TRANSFER_MODE` is unset, which is exactly the
+mode those tests exercise). The remaining gap to a green
+`phase4_one_step` is the Phase-5 sync-loop body in `train_entry.py`,
+not a sglang/Modal infrastructure issue.
 
 ---
 
