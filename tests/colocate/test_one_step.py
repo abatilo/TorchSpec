@@ -117,20 +117,46 @@ def test_phase4_one_step_completes_end_to_end(tmp_path: Path):
         f"cache_dir={cache_dir}",
     ]
 
-    proc = subprocess.run(
-        cmd,
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=1100,
-    )
+    log_path = tmp_path / "train_entry.log"
+    timed_out = False
+    with open(log_path, "wb") as logf:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            text=False,
+        )
+        try:
+            proc.wait(timeout=900)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            proc.wait(timeout=30)
 
-    tail = (proc.stdout + proc.stderr).splitlines()
-    print("\n=== one-step run last 400 lines ===")
-    for line in tail[-400:]:
+    with open(log_path, "rb") as f:
+        captured = f.read().decode("utf-8", errors="replace")
+    tail = captured.splitlines()
+    print("\n=== one-step run last 600 lines ===")
+    for line in tail[-600:]:
         print(line)
-    print("=== /one-step run last 400 lines ===\n")
+    print("=== /one-step run last 600 lines ===\n")
+
+    if timed_out:
+        # Dump nvidia-mps logs even on timeout — they're the most
+        # likely place to find what was actually wrong.
+        for log_p in ("/tmp/nvidia-log/control.log", "/tmp/nvidia-log/server.log"):
+            p = Path(log_p)
+            if p.exists():
+                print(f"\n=== {log_p} (last 4KB) ===")
+                with open(p, "rb") as f:
+                    print(f.read()[-4096:].decode("utf-8", errors="replace"))
+                print(f"=== /{log_p} ===\n")
+        raise AssertionError(
+            "train_entry timed out after 900s; see captured output above. "
+            "Common cause: NCCL/init_process_group rendezvous hang."
+        )
 
     if proc.returncode != 0:
         # MPS-related crashes only surface their root cause in the
