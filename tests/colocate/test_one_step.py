@@ -38,7 +38,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-pytestmark = pytest.mark.timeout(1200)
+pytestmark = pytest.mark.timeout(2000)
 
 
 def _has_h100_quad() -> bool:
@@ -128,8 +128,11 @@ def test_phase4_one_step_completes_end_to_end(tmp_path: Path):
             stderr=subprocess.STDOUT,
             text=False,
         )
+        # 30-minute budget: Qwen3-8B is ~16 GB and four engine subprocesses
+        # downloading from HF in parallel commonly takes 5-10 minutes on
+        # cold cache. After that the actual training step is < 1 min.
         try:
-            proc.wait(timeout=900)
+            proc.wait(timeout=1800)
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()
