@@ -1,15 +1,15 @@
-From 65f03e668c32cd920328f851535da2371e6eb331 Mon Sep 17 00:00:00 2001
+From b4162bdfc665d403e9dce43a82aee2dc44dff24f Mon Sep 17 00:00:00 2001
 From: xinghandd <xing.han@doordash.com>
 Date: Tue, 12 May 2026 23:32:09 -0700
 Subject: [PATCH] Re-apply colocate patch (round-trip verified)
 
 ---
  .../sglang/srt/distributed/parallel_state.py  |  75 ++++-
- .../srt/distributed/torchspec_colocate.py     | 258 ++++++++++++++++++
+ .../srt/distributed/torchspec_colocate.py     | 257 ++++++++++++++++++
  python/sglang/srt/managers/scheduler.py       |  39 ++-
  .../scheduler_output_processor_mixin.py       |  84 +++++-
  .../sglang/srt/model_executor/model_runner.py |  73 ++++-
- 5 files changed, 499 insertions(+), 30 deletions(-)
+ 5 files changed, 498 insertions(+), 30 deletions(-)
  create mode 100644 python/sglang/srt/distributed/torchspec_colocate.py
 
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
@@ -133,10 +133,10 @@ index 3070178b6..d7545961d 100644
          group_ranks,
 diff --git a/python/sglang/srt/distributed/torchspec_colocate.py b/python/sglang/srt/distributed/torchspec_colocate.py
 new file mode 100644
-index 000000000..a7e018bce
+index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,257 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -338,7 +338,6 @@ index 000000000..a7e018bce
 +        rank=global_rank,
 +        init_method=env.init_method,
 +        timeout=timedelta(minutes=env.timeout_minutes),
-+        device_id=device,
 +    )
 +
 +    # Mark the union world as up so a subsequent

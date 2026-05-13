@@ -231,13 +231,23 @@ def init_union_world(
         spec.world_size, spec.init_method, device,
     )
 
+    # NB: deliberately *do not* pass ``device_id=`` here. Passing it
+    # turns init_process_group into "eager init" mode where every rank
+    # must reach init_process_group before NCCL's socketPollConnect
+    # backoff exhausts itself (35 retries — single-digit seconds in
+    # practice). Trainers are ready in tens of seconds; engines
+    # sometimes need minutes for sglang scheduler subprocess startup
+    # and HF model download. The lazy default is what we want — the
+    # NCCL handshake happens on the first collective op (the broadcast
+    # the trainer issues right after init_process_group), and that
+    # collective inherits the 10-minute ``timeout`` we passed below
+    # so the slowest engine has plenty of slack to catch up.
     dist.init_process_group(
         backend="nccl",
         world_size=spec.world_size,
         rank=global_rank,
         init_method=spec.init_method,
         timeout=timedelta(minutes=spec.timeout_minutes),
-        device_id=device,
     )
 
     # Subgroups are collective: every rank must call new_group with the
