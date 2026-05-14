@@ -285,9 +285,22 @@ def init_union_world(
     # world (all 2N ranks are members) the True/False distinction is
     # otherwise equivalent — every rank participates either way — so
     # this just keeps both sides honest.
+    # Ordering invariant: the three *shared* (all-world) new_groups —
+    # sglang-paired nccl, sglang-paired gloo, meta_group — must be
+    # created BEFORE any role-restricted group (fsdp, trainer-only
+    # gloo). With use_local_synchronization=True, c10d derives each
+    # group's name from a hash that includes the per-process new_group
+    # counter; a shared group only rendezvouses if every member creates
+    # it at the same counter value. The engine side issues exactly
+    # three all-world new_groups (sglang init_world_group's nccl+gloo,
+    # then the patch's meta_group). If the trainer slips a trainer-only
+    # new_group (fsdp) in between, its counter runs ahead and the
+    # meta_group hash no longer matches the engine's — a hard
+    # rendezvous deadlock. Invisible at N=1 (fsdp is skipped); fatal at
+    # N>=2. So: all shared groups first, role-restricted groups after.
     logger.info(
-        "[colocate] %s rank %d: world.py creating sglang-paired world "
-        "new_groups (nccl + gloo on %d ranks) before meta_group",
+        "[colocate] %s rank %d: world.py new_group #1 sglang-paired nccl "
+        "(all %d ranks)",
         role, role_rank, spec.world_size,
     )
     _ = dist.new_group(
@@ -295,17 +308,39 @@ def init_union_world(
         backend="nccl",
         use_local_synchronization=True,
     )
+    logger.info(
+        "[colocate] %s rank %d: world.py new_group #2 sglang-paired gloo "
+        "(all %d ranks)",
+        role, role_rank, spec.world_size,
+    )
     _ = dist.new_group(
         ranks=all_world_ranks,
         backend="gloo",
         use_local_synchronization=True,
     )
+    logger.info(
+        "[colocate] %s rank %d: world.py new_group #3 meta_group gloo "
+        "(all %d ranks)",
+        role, role_rank, spec.world_size,
+    )
+    meta_group = dist.new_group(
+        ranks=all_world_ranks,
+        backend="gloo",
+        use_local_synchronization=True,
+    )
 
+    # Role-restricted groups — created AFTER all shared groups so the
+    # shared-group counter stays in lockstep with the engine side.
     fsdp_ranks = trainer_global_ranks(spec)
     if len(fsdp_ranks) >= 2:
         # NCCL 1-rank groups can hang under eager-init / `device_id`;
         # skip when there's only one trainer (e.g. tests at minimal
         # scale). FSDP itself doesn't need a group at world_size 1.
+        logger.info(
+            "[colocate] %s rank %d: world.py new_group #4 fsdp nccl "
+            "(trainer ranks %s)",
+            role, role_rank, fsdp_ranks,
+        )
         fsdp_group = dist.new_group(
             ranks=fsdp_ranks,
             backend="nccl",
@@ -320,12 +355,6 @@ def init_union_world(
     else:
         fsdp_group_for_role = None
 
-    meta_group = dist.new_group(
-        ranks=all_world_ranks,
-        backend="gloo",
-        use_local_synchronization=True,
-    )
-
     # Trainer-only gloo group for trainer-side barriers. Engine ranks
     # don't need to participate; we pass use_local_synchronization=True
     # so they skip the call entirely. On engine ranks the local handle
@@ -333,6 +362,11 @@ def init_union_world(
     # 1-trainer runs this is a 1-rank gloo group — gloo handles
     # 1-rank groups cleanly (unlike NCCL where 1-rank groups can hang
     # at eager init).
+    logger.info(
+        "[colocate] %s rank %d: world.py new_group #5 trainer-only gloo "
+        "(trainer ranks %s)",
+        role, role_rank, trainer_global_ranks(spec),
+    )
     trainer_only_gloo = dist.new_group(
         ranks=trainer_global_ranks(spec),
         backend="gloo",
@@ -345,8 +379,7 @@ def init_union_world(
         trainer_gloo_for_role = None
 
     logger.info(
-        "[colocate] %s rank %d: world.py meta_group + paired-world "
-        "+ trainer_gloo_group new_groups complete",
+        "[colocate] %s rank %d: world.py all new_groups complete",
         role, role_rank,
     )
 
