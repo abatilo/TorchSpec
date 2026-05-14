@@ -1080,7 +1080,93 @@ faster.
 
 ---
 
-## RunPod validation session (2026-05-13)
+## RunPod debug session #2 (2026-05-14, iters 1-10)
+
+10 iterations on a fresh H100 SXM SECURE pod (`252zbf9xlu3302`, $2.99/hr
+in Iceland). Goal: unblock `test_phase4_tiny_one_step` end-to-end on
+1×GPU. Each iter peeled off one layer of NCCL deadlock /
+init misalignment between the trainer (rank 0) and the engine TP
+scheduler subprocess (rank 1) in the 2-rank union world.
+
+### Iter chain — what each fix unblocked
+
+| Iter | Commit | What surfaced | Fix |
+|---|---|---|---|
+| 1 | d99b599 | Patch corrupt at line 707 | Forgot to update `@@` hunk line counts after adding `print()` instrumentation. |
+| 2 | cc717a6 | Patch applied; engine's sglang INFO logs visible (`Joining TorchSpec union world`) but `print()` stdout suppressed by sglang | Switch all `print(..., flush=True)` to `logger.warning(...)` so output goes through the same captured stream as the visible `logger.info`. |
+| 3 | 92b5368 | All instrumentation visible. **Identified hang point: NCCL c10d collective `new_group` deadlock** — engine creates per-engine TP/MoE_EP/MoE_TP/PP subgroups via 8 collective `new_group` calls; trainer creates only its own `meta_group`. Call counts + kinds don't match → both block at first new_group barrier. | (no fix yet, just diagnostic) |
+| 4 | 0a96522 | Same | Monkey-patch `dist.new_group` inside `init_union_default_pg` to default `use_local_synchronization=True`. Engine-only subgroups become member-only and the trainer doesn't need to participate. |
+| 5 | e52801b | Engine got past engine-local groups but `init_world_group` (called by sglang's `init_distributed_environment`) creates a 2-rank `_WORLD` GroupCoordinator that issues 2 world-spanning new_groups (nccl + gloo on all 2N ranks). Trainer was only calling its single meta_group (gloo). Count mismatch → deadlock. | Align: world.py emits the matching nccl+gloo world new_groups BEFORE meta_group; ModelRunner patch emits the matching meta_group new_group AFTER init_distributed_environment. |
+| 6 | 33f9195 | Patch corrupt at line 750 (off-by-4 in `@@ +787,N`) | Recount: 86 actual `+` lines + 6 context = `+787,92`. |
+| 7 | 69b14c6 | Trainer + engine new_groups now match in sequence/count, but trainer side uses `use_local_synchronization=False` (default) while engine uses `True` (via monkey-patch). c10d rendezvous can't reconcile mismatched flag values → still deadlocks on the very first paired new_group. | Trainer's world.py also passes `use_local_synchronization=True` for both world-paired new_groups and the meta_group (and for fsdp_group for the Phase 4+ case). |
+| 8 | 5746038 | New error: `assert self.cpu_group is not None` in `dp_attention.initialize_dp_attention`. Sglang computes `_ATTN_TP_GROUP` ranks from `range(0, pp_size * tp_size)` which lands in `[0, N)` (trainer half) but the engine's `self.rank` is in `[N, 2N)`. Membership check fails → `cpu_group` never set. | Post-patch surgery in `setup_sglang` (run_smoke_host.sh): Python string substitution adds a `_ts_offset = read_colocate_env().n_per_role` and rewrites the list comprehension to `list(range(_ts_offset + head, _ts_offset + head + _ATTN_TP_SIZE))`. Kept as a sed-style fixup rather than a patch hunk after `--recount` repeatedly choked on the format-patch trailer. |
+| 9 | (no fix) | Both sides now reach trainer.py:`_setup_device_mesh`. Trainer says `Device mesh (1D): world_size=2, dp_size=2` — wrong (should be `world_size=1` for the trainer-subgroup). The mesh was using `dist.get_world_size()` which is the 2-rank union world, so FSDP collectives would include the engine and deadlock. | (diagnosis only) |
+| 10 | 69f6978 | Patch trainer.py `_setup_device_mesh` to prefer `args.world_size` (= n_per_role, set by trainer_actor.py) over `dist.get_world_size()`; when smaller than dist's world, build a trainer-only NCCL sub-group via `dist.new_group(use_local_synchronization=True)` and attach a `DeviceMesh.from_group` rather than the world-shape-based `init_device_mesh`. | |
+
+### End-of-iter 10 state
+
+Both trainer and engine are now past every previously-deadlocking
+collective. Trainer reaches `trainer.py:186 Device mesh
+(1D-colocate-sub): world_size=1, dp_size=1, dist_world_size=2`,
+then `processing.py` (loss-mask token IDs), `Using flex attention on
+draft model training`, `Fetching 10 files: 100%` (HF download done).
+Engine reaches `[TS-COLOCATE-TRACE] trainer-paired meta_group
+new_group(gloo, [0,2)) completed` plus two more `is_colocate_active:
+True` calls (presumably from inside sglang's `initialize_model_parallel`).
+
+**Both then go silent for the full 15-minute pytest timeout.** The
+hang is now in model load / sglang scheduler boot / first NCCL
+collective on a 1-rank-NCCL-group. The original `world.py` comment
+explicitly warned about this:
+
+> NCCL 1-rank groups can hang under eager-init / device_id; skip when
+> there's only one trainer …
+
+— which is exactly the regime we're now in (trainer subgroup of
+size 1 in a 2-rank union world). Likely next failure mode:
+
+* sglang's `GroupCoordinator` for TP=1 spins up a pynccl
+  communicator on a 1-rank group; `ncclCommInitRank` may have
+  edge-case behavior there.
+* OR the trainer's FSDP wrap calls into 1-rank NCCL collectives
+  (typically all-reduce/all-gather) that hang on 1-rank groups.
+
+The next session should:
+
+1. Bring up a fresh pod with the iter-10 codebase (`69f6978` HEAD).
+2. Add NCCL stack-trace dumps on hang (`NCCL_LAUNCH_TIMEOUT`, run a
+   `py-spy dump` from a second SSH session on the hung trainer + engine
+   PIDs).
+3. If the hang is in pynccl init, either skip the per-rank
+   GroupCoordinator pynccl init for 1-rank groups (via another sglang
+   patch hunk), or use a 2-rank `nproc_per_node=2 tp_size=2` tiny config
+   so all NCCL groups have ≥2 members.
+4. If the hang is in FSDP, special-case `dp_size=1` in trainer.py to
+   skip FSDP wrap entirely (single-replica fallback).
+
+### Code committed this session
+
+| Commit | What |
+|---|---|
+| `3f7e708` | mooncake/store: lazy-import to unblock the colocate import chain on hosts without libibverbs / libnuma. |
+| `0089ad3` | utils/logging: configure the `torchspec` namespace logger so submodule INFO surfaces. |
+| `45cbc03` | docs/colocate: RunPod validation session findings + SM89+ requirement. |
+| `d99b599` | colocate.patch: instrument TP scheduler init path with `[TS-COLOCATE-TRACE]` checkpoints. |
+| `cc717a6` | colocate.patch: fix `@@` hunk line counts after the instrumentation. |
+| `92b5368` | colocate.patch: switch `print()` → `logger.warning()` so output survives sglang's stdout redirection. |
+| `0a96522` | colocate.patch: defang `dist.new_group` in the TP scheduler subprocess via a `use_local_synchronization=True` monkey-patch. |
+| `e52801b` | colocate: align trainer + engine world-group new_group sequence (world.py + colocate.patch). |
+| `33f9195` | colocate.patch: fix ModelRunner hunk line count (88 → 92). |
+| `69b14c6` | colocate/world: align `use_local_synchronization=True` flag with the engine side. |
+| `5746038` | colocate: dp_attention.py post-patch surgery for engine rank offset (sed-style, not a patch hunk). |
+| `69f6978` | trainer: build colocate-aware trainer-only DP mesh via `DeviceMesh.from_group`. |
+
+### Session cost
+
+* RunPod balance: $33.36 → $24.90 = **$8.46 spent across 10 iters**.
+* All on H100 SXM SECURE (Iceland) at $2.99/hr. Pod deleted at end.
+* SSH throwaway key cleaned up. No leaked resources.
+
 
 First end-to-end attempt to run the cheap-host smoke on a *real* MPS-capable
 host (RunPod community/secure pods). Goal: validate `test_colocate_tiny.py`
