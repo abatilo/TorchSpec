@@ -141,12 +141,30 @@ def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
         model = model.to_empty(device=torch.cuda.current_device())
 
     is_cpu_offload = cpu_offload is not None
+
+    # `broadcast_from_rank0=True` makes PyTorch's set_model_state_dict
+    # broadcast the rank-0 state dict across the *default* process
+    # group. In colocate mode the default PG is the 2N-rank union
+    # world; the engine never enters this code path so that broadcast
+    # hangs. When the FSDP mesh is a single trainer rank there's
+    # nothing to broadcast anyway — rank 0 already holds the full
+    # state — so we disable the broadcast and let rank 0 load locally.
+    # For multi-trainer colocate (>=2) we'd need set_model_state_dict
+    # to accept an explicit group; tracked as a follow-up — the tiny
+    # smoke is dp_size=1 so this unblocks it now.
+    mesh_size = device_mesh.size() if device_mesh is not None else dist.get_world_size()
+    single_rank_mesh = mesh_size == 1
+    broadcast_from_rank0 = not single_rank_mesh
     options = StateDictOptions(
-        full_state_dict=True, cpu_offload=is_cpu_offload, broadcast_from_rank0=True
+        full_state_dict=True,
+        cpu_offload=is_cpu_offload,
+        broadcast_from_rank0=broadcast_from_rank0,
     )
 
     logger.warning(
-        "[TS-COLOCATE-TRACE-T] fsdp2_load_full_state_dict: BEFORE set_model_state_dict"
+        "[TS-COLOCATE-TRACE-T] fsdp2_load_full_state_dict: BEFORE "
+        "set_model_state_dict (mesh_size=%s, broadcast_from_rank0=%s)",
+        mesh_size, broadcast_from_rank0,
     )
     set_model_state_dict(model, full_state, options=options)
     logger.warning(
