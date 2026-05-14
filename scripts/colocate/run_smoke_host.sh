@@ -289,6 +289,54 @@ assert new_src != src, "dp_attention.py: no substitution made"
 target.write_text(new_src)
 print(f"[dp_attention] patched {target}: +14 offset lines, 1 range() rewrite")
 PYEOF
+
+  # Post-patch surgery #2: tp_worker.py's broadcast_pyobj callsite for
+  # the random-seed sync passes `self.tp_size * self.pp_rank + tp_rank`
+  # as the `rank` argument. broadcast_pyobj's docstring says that arg
+  # is the *global* rank, and `src` is `self.world_group.ranks[0]`
+  # (also a global rank). In standalone sglang the engine owns the
+  # whole world so tp-local rank == global rank and it works. Under
+  # colocate the engine's global rank is N (=1 for the tiny config)
+  # but its tp-local rank is 0, so rank(0) != src(1): the engine
+  # wrongly takes broadcast_pyobj's *receiver* path, gets size 0,
+  # returns [], and the trailing [0] index raises
+  # `IndexError: list index out of range`. Pass the GroupCoordinator's
+  # global `.rank` instead — correct for both colocate and standalone.
+  banner "sglang: tp_worker.py broadcast_pyobj global-rank fix (post-patch surgery)"
+  SGLANG_DIR="$SGLANG_DIR" "$PYTHON" - <<'PYEOF'
+import os, pathlib, sys
+
+target = pathlib.Path(
+    os.environ["SGLANG_DIR"]
+) / "python/sglang/srt/managers/tp_worker.py"
+src = target.read_text()
+
+old = (
+    "        self.random_seed = broadcast_pyobj(\n"
+    "            [server_args.random_seed],\n"
+    "            self.tp_size * self.pp_rank + tp_rank,\n"
+    "            self.world_group.cpu_group,\n"
+    "            src=self.world_group.ranks[0],\n"
+    "        )[0]"
+)
+new = (
+    "        self.random_seed = broadcast_pyobj(\n"
+    "            [server_args.random_seed],\n"
+    "            self.world_group.rank,  # global rank (colocate-safe)\n"
+    "            self.world_group.cpu_group,\n"
+    "            src=self.world_group.ranks[0],\n"
+    "        )[0]"
+)
+if "self.world_group.rank,  # global rank (colocate-safe)" in src:
+    print(f"[tp_worker] already patched, skipping: {target}")
+    sys.exit(0)
+assert old in src, (
+    "tp_worker.py: broadcast_pyobj random-seed anchor not found "
+    "(sglang version drift?)"
+)
+target.write_text(src.replace(old, new, 1))
+print(f"[tp_worker] patched {target}: broadcast_pyobj rank arg -> global rank")
+PYEOF
 }
 
 setup_python() {
