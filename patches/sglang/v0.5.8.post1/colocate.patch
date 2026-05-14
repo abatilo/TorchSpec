@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,387 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -222,19 +222,25 @@ index 000000000..aba6359c1
 +    def init_method(self) -> str:
 +        return f"tcp://{self.master_addr}:{self.master_port}"
 +
-+    def engine_global_rank(self, tp_rank: int) -> int:
-+        """Map this engine subprocess' TP rank to its union-world rank.
++    def engine_global_rank(self, tp_rank: int = 0) -> int:
++        """Return this engine subprocess' union-world rank.
 +
-+        Engines occupy ``[N, 2N)`` in the union world, contiguous block
-+        following the trainer ranks. The trainer at union rank ``i`` is
-+        paired with the engine TP rank ``i`` (so engine global rank is
-+        ``N + i``).
++        Engines occupy ``[N, 2N)`` in the union world. Under the
++        colocate invariant (``engine_count * engine_tp_size ==
++        training_world_size`` with ``engine_tp_size == 1``) each engine
++        is paired 1:1 with a trainer, so the engine *index* is exactly
++        ``paired_trainer_rank`` and the union rank is
++        ``N + paired_trainer_rank``. ``tp_rank`` is the TP rank *within*
++        this engine's own size-1 TP group (always 0) and is NOT the
++        union-world offset — passing it as the offset made every engine
++        claim rank N (fine at N=1, a hard rendezvous deadlock at N>1).
 +        """
-+        if not 0 <= tp_rank < self.n_per_role:
++        if not 0 <= self.paired_trainer_rank < self.n_per_role:
 +            raise ValueError(
-+                f"tp_rank={tp_rank} out of range [0, {self.n_per_role})"
++                f"paired_trainer_rank={self.paired_trainer_rank} out of "
++                f"range [0, {self.n_per_role})"
 +            )
-+        return self.n_per_role + tp_rank
++        return self.n_per_role + self.paired_trainer_rank
 +
 +
 +def is_colocate_active() -> bool:
@@ -427,25 +433,27 @@ index 000000000..aba6359c1
 +
 +
 +def build_engine_tp_ranks(env: ColocateEnv) -> list[int]:
-+    """Return the contiguous union-world ranks that form sglang's TP group.
++    """Return the union-world ranks forming THIS engine's TP group.
 +
-+    For the colocate-config invariant
-+    ``engine_count * engine_tp_size == training_world_size == N``,
-+    sglang's TP group is exactly the ``[N, 2N)`` half of the union
-+    world. This is what we hand to the patched
-+    ``initialize_model_parallel(..., tp_world_ranks=...)``.
++    Under the colocate-config invariant ``engine_count *
++    engine_tp_size == training_world_size`` with ``engine_tp_size ==
++    1``, each engine is its own singleton TP group: union rank
++    ``[N + paired_trainer_rank]``. Used both for
++    ``initialize_model_parallel(..., tp_world_ranks=...)`` (whose
++    length must equal ``tensor_model_parallel_size``) and for
++    ``rebuild_world_group_engine_only`` (this engine's own ``_WORLD``).
 +
-+    For the simpler ``tp_size=1`` case (the colocate-qwen3-8b-1node
-+    example), each engine is a singleton TP group ``[N + i]``; the
-+    sglang patch detects ``tp_size==1`` separately and skips the
-+    multi-rank TP group construction entirely.
++    The old ``range(N, 2N)`` form returned every engine rank — a
++    length-1 singleton at N=1 (so it worked) but a length-N list at
++    N>1, which mismatched ``tp_size=1`` and cross-wired the engines'
++    ``_WORLD`` groups.
 +    """
-+    return list(range(env.n_per_role, 2 * env.n_per_role))
++    return [env.n_per_role + env.paired_trainer_rank]
 +
 +
 +def rebuild_world_group_engine_only(env, local_rank, backend="nccl"):
-+    """Rebuild sglang's ``_WORLD`` GroupCoordinator to span only the
-+    engine ranks ``[N, 2N)`` instead of the full ``2N`` union world.
++    """Rebuild sglang's ``_WORLD`` GroupCoordinator to span only this
++    engine's own union rank instead of the full ``2N`` union world.
 +
 +    sglang's ``init_distributed_environment`` builds ``_WORLD`` from
 +    ``torch.distributed.get_world_size()``, which under colocate is
