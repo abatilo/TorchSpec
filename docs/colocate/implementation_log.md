@@ -1381,3 +1381,66 @@ That means we still don't know whether the TP scheduler is:
 Total session spend: ~$2.83 across two A100 runs + two H100 runs + a
 brief leaked-pod incident ($0.02, caught in seconds by the next
 `pod list`).
+
+---
+
+## RunPod debug session #3 (2026-05-14, iters 11-20) — `test_colocate_tiny.py` GREEN
+
+Continued on a warm H100 SXM SECURE pod (`qzztjz357m0hqt`, $2.99/hr).
+Iters 11-16 cleared the end-of-iter-10 "both sides go silent" hang —
+it was a cluster of unscoped `dist.*` collectives landing on the 2N
+union default PG (where trainer and engine run different code paths,
+so any unscoped collective deadlocks). Iters 17-20 then peeled off
+three config/correctness bugs to reach the first green run.
+
+### Iter chain — what each fix unblocked
+
+| Iter | Commit | What surfaced | Fix |
+|---|---|---|---|
+| 11 | 08976e5 | 1-rank NCCL DP group hang; `dist.barrier()` in save path on union meta_group | Trainer-only gloo group bound to `GLOO_GROUP`; 1-trainer DP group falls back to gloo (NCCL 1-rank groups hang at eager init). |
+| 12 | 2d44799 | `fsdp2_load_full_state_dict` broadcasts on the default (union) PG | Scope FSDP broadcasts to `device_mesh.get_group()`. |
+| 13 | 19474e9 | `set_model_state_dict(broadcast_from_rank0=True)` hangs on a single-rank mesh | Disable `broadcast_from_rank0` for 1-rank trainer mesh. |
+| 14 | 09729f8 | Multiple trainer-side `dist.*` collectives (eagle3 target-LM-head init, metric all-reduce, 4× checkpoint barriers) on the default PG | Scope every trainer-side collective to `get_gloo_group()` (the trainer-only gloo group). |
+| 15 | 2b1d68c | `KeyError: lm_head.weight` — Qwen3-0.6B-Base ties embeddings, ships no standalone `lm_head.weight` | `TargetLMHead` loader falls back to `model.embed_tokens.weight` when `config.tie_word_embeddings`. |
+| 16 | 8bdc8d4 | `get_available_gpu_memory` hangs — sglang's `_WORLD` is the 2N union, so its world-barrier waits on trainer ranks that never run sglang code | `rebuild_world_group_engine_only`: rebuild sglang `_WORLD` as engine-only `[N, 2N)` after `init_distributed_environment`. |
+| 16 | a37451a | `broadcast_pyobj IndexError` — sglang's tp-local rank arg vs global union rank mismatch | Post-patch surgery: pass `self.world_group.rank` instead of `tp_size*pp_rank + tp_rank`. |
+| 17 | a237673 | `RuntimeError: Colocate loop requires aux_hidden_states_layers to be set` — the colocate loop sizes the transfer buffer up front; DFlash had an auto-resolver but Eagle3 didn't | `_maybe_resolve_colocate_aux_layers` in `train_entry.py` resolves via `get_default_eagle3_aux_layer_ids` — the same default `sgl_engine` falls back to, so both sides agree. |
+| 18 | 49cb154 | `NCCL WARN Duplicate GPU detected : rank 1 and rank 0 both on CUDA device db000` — the union world's NCCL backend cannot form a communicator spanning two ranks on one physical GPU, which is *exactly* the colocate topology. Phase 3's P2P smoke validated on 2 separate GPUs (1 rank each) and never hit this. | Route the engine→trainer hidden-state P2P over the existing all-rank **gloo** `meta_group` with host-memory staging. `NcclHiddenStatesConnector.send` / `NcclMultiTensorFetcher.recv_step` branch on the group backend; gloo path stages through CPU and uses tagged `dist.send`/`recv`. Engine-side `meta_group` exposed via `set/get_union_meta_group` in the patch. |
+| 19 | 6d55b82 | `test_phase4_tiny_one_step` **PASSED**. `test_phase7` failed: every step logged `loss=None` and the log parser found zero loss points. | The colocate loop read `metrics.get("train/loss")`, but `_aggregate_metrics` (both Eagle3 and DFlash) emits `train/avg_loss` — matching the disagg loop. One-key fix. |
+| 20 | — | **Both tiny tests PASSED.** | — |
+
+### End state — `test_colocate_tiny.py` green on 1×H100
+
+```
+test_phase4_tiny_one_step       PASSED   (completed_steps=1 / num_steps=1)
+test_phase7_tiny_loss_decreases PASSED   (loss 12.02 → 9.74 over 20 steps)
+======================== 2 passed in 175.33s ========================
+```
+
+The full colocate path is now exercised end-to-end on a single GPU:
+MPS daemon, 2-rank union world, the patched sglang (engine-only `_WORLD`,
+union-default PG, `dp_attention` rank offset), the engine→trainer
+hidden-state transfer (gloo, CPU-staged), `NcclMultiTensorFetcher`,
+the Eagle3 draft forward/backward, and the optimizer step. Loss
+decreases monotonically in the windowed average, so gradients flow
+through real (not garbage) transferred hidden states.
+
+### Key architectural correction
+
+The Phase 2-4 design assumed NCCL P2P "uses CUDA's intra-device path"
+for same-GPU sender/receiver. **It cannot** — NCCL hard-rejects a
+communicator with two ranks on one physical GPU (`ncclInvalidUsage`,
+"Duplicate GPU detected"), and there is no env-var override. The
+colocate hidden-state plane must use gloo (host-staged) or CUDA IPC.
+This session ships the gloo route; the NCCL batched path is retained
+only for the separate-GPU Phase-3 dummy P2P tests. CUDA IPC remains a
+possible future optimization (zero-copy intra-device) but gloo on a
+shared host is fast enough for the correctness suite.
+
+### Next
+
+Provision 4×H100 and run `--full` for the remaining MPS-gated tests:
+`test_one_step`, `test_grad_parity`, `test_stability`, `test_convergence`.
+The 4-GPU union world has two ranks per GPU on *four* GPUs — the gloo
+`meta_group` routing handles this identically, but FSDP across the
+4-trainer NCCL subgroup gets its first real (≥2-rank) exercise there.
