@@ -218,6 +218,21 @@ def _normalise_dtype(dtype: Any) -> torch.dtype:
     )
 
 
+def _group_is_gloo(group: Optional[dist.ProcessGroup]) -> bool:
+    """True iff ``group`` (or the default PG) uses the gloo backend.
+
+    The colocate path runs the transfer over a gloo group: trainer and
+    engine share one physical GPU, and NCCL refuses to form a
+    communicator with two ranks on the same device ("Duplicate GPU
+    detected"). gloo stages through host memory, so colocate uses it
+    for the engine→trainer P2P.
+    """
+    try:
+        return str(dist.get_backend(group)).lower() == "gloo"
+    except Exception:
+        return False
+
+
 class NcclMultiTensorFetcher:
     """Trainer-side multi-tensor receiver for the colocate path.
 
@@ -287,6 +302,25 @@ class NcclMultiTensorFetcher:
             raise ValueError("recv_step requires at least one tensor spec")
 
         names = _sorted_tensor_names(tensor_specs)
+
+        if _group_is_gloo(self._group):
+            # Colocate transport: receive into host buffers over the
+            # gloo union group (NCCL can't span two ranks on one GPU),
+            # then copy up to the device. tag=index matches the
+            # sender's per-tensor tag.
+            logger.debug(
+                "NcclMultiTensorFetcher.recv_step (gloo): src=%d names=%s",
+                self._src, names,
+            )
+            out: Dict[str, torch.Tensor] = {}
+            for tag, name in enumerate(names):
+                shape, dtype_raw = tensor_specs[name]
+                dtype = _normalise_dtype(dtype_raw)
+                cpu_buf = torch.empty(tuple(shape), dtype=dtype, device="cpu")
+                dist.recv(cpu_buf, src=self._src, group=self._group, tag=tag)
+                out[name] = cpu_buf.to(self._device)
+            return out
+
         buffers: Dict[str, torch.Tensor] = {}
         ops = []
         for name in names:

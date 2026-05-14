@@ -76,6 +76,21 @@ TRANSFER_MODE_ENV = "TORCHSPEC_COLOCATE_TRANSFER_MODE"
 PAIRED_TRAINER_RANK_ENV = "TORCHSPEC_COLOCATE_PAIRED_TRAINER_RANK"
 
 
+def _group_is_gloo(group: Optional[dist.ProcessGroup]) -> bool:
+    """True iff ``group`` (or the default PG) uses the gloo backend.
+
+    The colocate path runs the transfer over a gloo group: trainer and
+    engine share one physical GPU, and NCCL refuses to form a
+    communicator with two ranks on the same device ("Duplicate GPU
+    detected"). gloo has no such restriction — it stages through host
+    memory — so colocate uses it for the engine→trainer P2P.
+    """
+    try:
+        return str(dist.get_backend(group)).lower() == "gloo"
+    except Exception:
+        return False
+
+
 def sorted_tensor_names(tensors: Dict[str, torch.Tensor]) -> list[str]:
     """Canonical send/recv ordering: sorted by key.
 
@@ -160,6 +175,24 @@ class NcclHiddenStatesConnector:
             )
 
         names = sorted_tensor_names(tensors)
+
+        if _group_is_gloo(self._group):
+            # Colocate transport: trainer + engine share one physical
+            # GPU, so NCCL refuses a communicator spanning both ranks.
+            # Stage each tensor through host memory and send over the
+            # gloo union group. The blocking .cpu() copy synchronises
+            # the producing CUDA stream, so the bytes on the wire are
+            # the finished hidden states. tag=index pairs each send
+            # with the receiver's matching recv unambiguously.
+            logger.debug(
+                "NcclHiddenStatesConnector.send (gloo): dst=%d names=%s",
+                self._dst, names,
+            )
+            for tag, name in enumerate(names):
+                cpu_t = tensors[name].detach().to("cpu", copy=True).contiguous()
+                dist.send(cpu_t, dst=self._dst, group=self._group, tag=tag)
+            return
+
         ops = []
         for name in names:
             t = tensors[name]

@@ -278,6 +278,7 @@ class Trainer(abc.ABC):
         return NcclMultiTensorFetcher(
             src_global_rank=self._union_world.paired_global_rank,
             device=gpu_device,
+            group=self._union_world.meta_group,
         )
 
     def set_train_queue(

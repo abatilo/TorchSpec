@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,379 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -187,6 +187,24 @@ index 000000000..aba6359c1
 +_UNION_N_PER_ROLE_ENV = "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE"
 +_UNION_TIMEOUT_MIN_ENV = "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN"
 +_UNION_INITIALIZED_ENV = "TORCHSPEC_COLOCATE_UNION_WORLD"
++
++# The gloo process group spanning all 2N union-world ranks. The
++# engine->trainer hidden-state P2P runs over this (not NCCL): trainer
++# and engine share one physical GPU and NCCL refuses a communicator
++# with two ranks on the same device. Set once by init_torch_distributed
++# right after the meta_group new_group; read by build_hidden_states_writer.
++_UNION_META_GROUP = None
++
++
++def set_union_meta_group(group) -> None:
++    """Stash the all-rank gloo union group for the hidden-states writer."""
++    global _UNION_META_GROUP
++    _UNION_META_GROUP = group
++
++
++def get_union_meta_group():
++    """Return the all-rank gloo union group, or None if not yet set."""
++    return _UNION_META_GROUP
 +
 +
 +@dataclass(frozen=True)
@@ -487,8 +505,16 @@ index 000000000..aba6359c1
 +            "TorchSpec checkout) and that PYTHONPATH includes it."
 +        ) from e
 +
++    meta_group = get_union_meta_group()
++    if meta_group is None:
++        raise RuntimeError(
++            "build_hidden_states_writer: union meta_group not set. "
++            "init_torch_distributed must call set_union_meta_group "
++            "before the scheduler builds the writer."
++        )
 +    return NcclHiddenStatesConnector(
 +        dst_global_rank=env.paired_trainer_rank,
++        group=meta_group,
 +    )
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
 index f8c65272c..c234e1816 100644
@@ -662,7 +688,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
 index d0ff3eb8d..cd98d9d3d 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -58,6 +58,12 @@ from sglang.srt.distributed import (
+@@ -58,6 +58,13 @@ from sglang.srt.distributed import (
      set_mscclpp_all_reduce,
      set_torch_symm_mem_all_reduce,
  )
@@ -671,6 +697,7 @@ index d0ff3eb8d..cd98d9d3d 100644
 +    init_union_default_pg,
 +    is_colocate_active,
 +    rebuild_world_group_engine_only,
++    set_union_meta_group,
 +)
  from sglang.srt.distributed.device_communicators.pynccl_allocator import (
      use_symmetric_memory,
@@ -747,10 +774,10 @@ index d0ff3eb8d..cd98d9d3d 100644
 +                # world-collective call (every rank is a member), so we can
 +                # just use the regular dist.new_group here.
 +                import torch.distributed as _dist
-+                _torchspec_meta_group = _dist.new_group(  # noqa: F841
++                set_union_meta_group(_dist.new_group(
 +                    ranks=list(range(colocate_env.world_size)),
 +                    backend="gloo",
-+                )
++                ))
 +                logger.warning(
 +                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
 +                    f"init_torch_distributed: trainer-paired meta_group "
