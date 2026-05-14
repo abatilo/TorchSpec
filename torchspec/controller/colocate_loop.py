@@ -318,10 +318,11 @@ def run_colocate_training_loop(
                 if completed_steps % 5 == 0 or completed_steps <= 5:
                     logger.info(
                         "[colocate_loop] step=%d step_time=%.3fs "
-                        "loss=%s lr=%s",
+                        "loss=%s lr=%s peak_alloc=%s",
                         completed_steps, step_dt,
                         metrics.get("train/avg_loss"),
                         metrics.get("train/lr"),
+                        metrics.get("perf/peak_bytes_allocated"),
                     )
 
     progress.close()
