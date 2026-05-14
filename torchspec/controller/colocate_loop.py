@@ -320,7 +320,7 @@ def run_colocate_training_loop(
                         "[colocate_loop] step=%d step_time=%.3fs "
                         "loss=%s lr=%s",
                         completed_steps, step_dt,
-                        metrics.get("train/loss"),
+                        metrics.get("train/avg_loss"),
                         metrics.get("train/lr"),
                     )
 
