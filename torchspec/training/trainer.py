@@ -109,8 +109,26 @@ class Trainer(abc.ABC):
     # ------------------------------------------------------------------
 
     def _setup_device_mesh(self) -> None:
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
+        # Under colocate (MPS + NCCL union world), `dist.get_world_size()`
+        # is the 2N-rank union world (N trainers + N engines), but the
+        # trainer's data-parallel mesh should only span the trainer half
+        # `[0, N)`. trainer_actor.py overrides args.world_size/args.rank
+        # to the trainer-subgroup values for exactly this reason; we
+        # prefer them over the dist-level values so the mesh doesn't
+        # accidentally include engine ranks (FSDP collectives on a mesh
+        # that contains a non-FSDP rank deadlock on the first
+        # all-reduce).
+        dist_world_size = dist.get_world_size()
+        args_world_size = getattr(self.args, "world_size", None)
+        if args_world_size is None or args_world_size == 0:
+            world_size = dist_world_size
+        else:
+            world_size = int(args_world_size)
+        args_rank = getattr(self.args, "rank", None)
+        if args_rank is None:
+            rank = dist.get_rank()
+        else:
+            rank = int(args_rank)
         self.cache_rank = rank
 
         usp_mesh = None
@@ -135,13 +153,40 @@ class Trainer(abc.ABC):
         self.dp_size = world_size
         self.dp_rank = rank
 
-        self.mesh = init_device_mesh("cuda", mesh_shape=(self.dp_size,), mesh_dim_names=("dp",))
-        self.dp_group = self.mesh.get_group("dp")
+        if world_size < dist_world_size:
+            # Colocate sub-world: build a trainer-only NCCL sub-group
+            # and an attached mesh so FSDP collectives stay within the
+            # trainer slice and never reach the engine ranks.
+            # use_local_synchronization=True so the engine subprocesses
+            # (non-members) don't need to participate in the call.
+            trainer_ranks = list(range(world_size))
+            trainer_pg = dist.new_group(
+                ranks=trainer_ranks,
+                backend="nccl",
+                use_local_synchronization=True,
+            )
+            from torch.distributed.device_mesh import DeviceMesh
+
+            self.mesh = DeviceMesh.from_group(
+                trainer_pg, "cuda", mesh_dim_names=("dp",)
+            )
+            self.dp_group = trainer_pg
+            mesh_kind = "1D-colocate-sub"
+        else:
+            self.mesh = init_device_mesh(
+                "cuda",
+                mesh_shape=(self.dp_size,),
+                mesh_dim_names=("dp",),
+            )
+            self.dp_group = self.mesh.get_group("dp")
+            mesh_kind = "1D"
         self.dp_mesh = self.mesh
         self.grad_sync_mesh = self.dp_mesh
 
         logger.info(
-            f"[Rank {rank}] Device mesh (1D): world_size={world_size}, dp_size={self.dp_size}"
+            f"[Rank {rank}] Device mesh ({mesh_kind}): "
+            f"world_size={world_size}, dp_size={self.dp_size}, "
+            f"dist_world_size={dist_world_size}"
         )
 
     def _get_init_weight_context_manager(self):
