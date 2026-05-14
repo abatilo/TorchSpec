@@ -49,7 +49,11 @@ from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.nccl_data_fetcher import NcclMultiTensorFetcher
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
+from torchspec.utils.distributed import (
+    get_gloo_group,
+    get_usp_device_mesh,
+    get_usp_grad_sync_mesh,
+)
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -667,7 +671,10 @@ class Trainer(abc.ABC):
                     )
 
         if dist.is_initialized():
-            dist.barrier()
+            # Trainer-only group: in colocate mode the default PG is the
+            # union world and the engine never enters the checkpoint
+            # save path.
+            dist.barrier(group=get_gloo_group())
 
     def load_checkpoint(self) -> dict | None:
         return checkpoint.load(self)

@@ -32,6 +32,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torchspec.utils.distributed import get_gloo_group
 from torchspec.utils.logging import logger
 
 
@@ -249,7 +250,7 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
 
 def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None:
     if checkpoint_payload is None:
-        dist.barrier()
+        dist.barrier(group=get_gloo_group())
         return
 
     continual_training = getattr(actor.args, "continual_training", False)
@@ -276,7 +277,7 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
         _restore_fp32_master_params(actor, checkpoint_payload["optimizer_dir"])
 
     torch.cuda.synchronize()
-    dist.barrier()
+    dist.barrier(group=get_gloo_group())
 
 
 def save(actor: Any, step: int) -> None:
@@ -299,7 +300,7 @@ def save(actor: Any, step: int) -> None:
         model_dir.mkdir(parents=True, exist_ok=True)
         optimizer_dir.mkdir(parents=True, exist_ok=True)
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    dist.barrier(group=get_gloo_group())
 
     # Save model weights
     model_state = ModelState(actor.model)
@@ -337,4 +338,4 @@ def save(actor: Any, step: int) -> None:
         tracker_file.write_text(str(step_id))
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
-    dist.barrier()
+    dist.barrier(group=get_gloo_group())
