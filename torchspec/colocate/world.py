@@ -252,12 +252,32 @@ def init_union_world(
 
     # Subgroups are collective: every rank must call new_group with the
     # same args, even ranks not in the resulting subgroup.
+    all_world_ranks = list(range(spec.world_size))
+
+    # sglang's `init_distributed_environment` -> `init_world_group` ->
+    # `GroupCoordinator.__init__` creates a (nccl, gloo) pair of world-
+    # spanning subgroups for its `_WORLD` GroupCoordinator. Those calls
+    # are collective on the world group, so this rank must call the
+    # matching new_groups in the same order — otherwise the engine TP
+    # scheduler subprocess hangs forever in `init_distributed_environment`
+    # waiting for the trainer half of the rendezvous (validated on
+    # RunPod H100 SXM, see implementation_log.md §RunPod validation
+    # session). We discard the resulting handles since this side
+    # doesn't actually use sglang's world group, but the new_group
+    # collective bookkeeping must match.
+    _ = dist.new_group(ranks=all_world_ranks, backend="nccl")
+    _ = dist.new_group(ranks=all_world_ranks, backend="gloo")
+
     fsdp_ranks = trainer_global_ranks(spec)
     if len(fsdp_ranks) >= 2:
         # NCCL 1-rank groups can hang under eager-init / `device_id`;
         # skip when there's only one trainer (e.g. tests at minimal
         # scale). FSDP itself doesn't need a group at world_size 1.
-        fsdp_group = dist.new_group(ranks=fsdp_ranks, backend="nccl")
+        fsdp_group = dist.new_group(
+            ranks=fsdp_ranks,
+            backend="nccl",
+            use_local_synchronization=True,
+        )
         if role != ROLE_TRAINER:
             # Engines aren't in the FSDP group; expose None so calling
             # FSDP collectives on this is a clear error rather than a hang.
@@ -268,7 +288,7 @@ def init_union_world(
         fsdp_group_for_role = None
 
     meta_group = dist.new_group(
-        ranks=list(range(spec.world_size)), backend="gloo"
+        ranks=all_world_ranks, backend="gloo"
     )
 
     os.environ[UNION_WORLD_ENV_MARKER] = "1"

@@ -638,7 +638,7 @@ index d0ff3eb8d..cd98d9d3d 100644
  from sglang.srt.distributed.device_communicators.pynccl_allocator import (
      use_symmetric_memory,
  )
-@@ -782,21 +787,72 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -782,21 +787,88 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                      )
  
@@ -699,6 +699,26 @@ index d0ff3eb8d..cd98d9d3d 100644
 +                    # init_method for symmetry.
 +                    distributed_init_method=colocate_env.init_method,
 +                    timeout=self.server_args.dist_timeout,
++                )
++                # Match the trainer's torchspec.colocate.world.init_union_world
++                # which finishes with `dist.new_group(ranks=[0..2N), gloo)` for
++                # its meta_group. The engine subprocess must participate in
++                # that collective new_group on the world; otherwise the
++                # trainer hangs after init_distributed_environment returns.
++                # For ranks covering the whole world the monkey-patched
++                # use_local_synchronization=True default is equivalent to a
++                # world-collective call (every rank is a member), so we can
++                # just use the regular dist.new_group here.
++                import torch.distributed as _dist
++                _torchspec_meta_group = _dist.new_group(  # noqa: F841
++                    ranks=list(range(colocate_env.world_size)),
++                    backend="gloo",
++                )
++                logger.warning(
++                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
++                    f"init_torch_distributed: trainer-paired meta_group "
++                    f"new_group(gloo, [0,{colocate_env.world_size})) "
++                    f"completed"
 +                )
 +                initialize_model_parallel(
 +                    tensor_model_parallel_size=self.tp_size,
