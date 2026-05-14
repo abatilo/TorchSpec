@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,292 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -612,7 +612,7 @@ index d0ff3eb8d..cd98d9d3d 100644
  from sglang.srt.distributed.device_communicators.pynccl_allocator import (
      use_symmetric_memory,
  )
-@@ -782,21 +787,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -782,21 +787,75 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                      )
  
