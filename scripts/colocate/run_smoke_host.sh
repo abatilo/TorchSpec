@@ -239,6 +239,56 @@ setup_sglang() {
     git apply --recount "$PATCHES_DIR/sglang.patch" || true
     git apply --recount "$PATCHES_DIR/colocate.patch"
   )
+  # Post-patch surgery: dp_attention.py's _ATTN_TP_GROUP assumes ranks
+  # are [0, tp_size*pp_size), but in colocate mode the engine sits at
+  # ranks [N, 2N). Without the offset, GroupCoordinator's
+  # `self.rank in ranks` check is False on every engine and the
+  # `assert self.cpu_group is not None` at the end of
+  # GroupCoordinator.__init__ fires. Kept as a string-substitution
+  # fixup rather than a colocate.patch hunk because the unified-diff
+  # format is fragile to context drift across sglang versions; the
+  # string anchors below are stable across 0.5.x.
+  banner "sglang: dp_attention.py colocate rank offset (post-patch surgery)"
+  SGLANG_DIR="$SGLANG_DIR" "$PYTHON" - <<'PYEOF'
+import os, pathlib, sys
+
+target = pathlib.Path(
+    os.environ["SGLANG_DIR"]
+) / "python/sglang/srt/layers/dp_attention.py"
+src = target.read_text()
+
+if "_ts_offset" in src:
+    print(f"[dp_attention] already patched, skipping: {target}")
+    sys.exit(0)
+
+inject = (
+    "    # TorchSpec colocate: shift attn_tp group ranks by N\n"
+    "    # (engine_global_rank_base) so engine ranks land in the\n"
+    "    # union-world slice [N, 2N). Default 0 keeps non-colocate\n"
+    "    # runs byte-identical.\n"
+    "    try:\n"
+    "        from sglang.srt.distributed.torchspec_colocate import (\n"
+    "            is_colocate_active,\n"
+    "            read_colocate_env,\n"
+    "        )\n"
+    "        _ts_offset = (\n"
+    "            read_colocate_env().n_per_role if is_colocate_active() else 0\n"
+    "        )\n"
+    "    except Exception:\n"
+    "        _ts_offset = 0\n"
+)
+needle = "    _ATTN_TP_GROUP = GroupCoordinator(\n"
+assert needle in src, "dp_attention.py: anchor for _ATTN_TP_GROUP not found"
+new_src = src.replace(needle, inject + needle, 1)
+new_src = new_src.replace(
+    "list(range(head, head + _ATTN_TP_SIZE))",
+    "list(range(_ts_offset + head, _ts_offset + head + _ATTN_TP_SIZE))",
+    1,
+)
+assert new_src != src, "dp_attention.py: no substitution made"
+target.write_text(new_src)
+print(f"[dp_attention] patched {target}: +14 offset lines, 1 range() rewrite")
+PYEOF
 }
 
 setup_python() {
