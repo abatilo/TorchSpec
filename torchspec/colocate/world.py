@@ -265,8 +265,31 @@ def init_union_world(
     # session). We discard the resulting handles since this side
     # doesn't actually use sglang's world group, but the new_group
     # collective bookkeeping must match.
-    _ = dist.new_group(ranks=all_world_ranks, backend="nccl")
-    _ = dist.new_group(ranks=all_world_ranks, backend="gloo")
+    #
+    # `use_local_synchronization=True` is required for symmetry with
+    # the engine side: the colocate sglang patch installs a
+    # dist.new_group monkey-patch that defaults the flag to True for
+    # every call inside the engine TP scheduler subprocess. If the two
+    # sides disagree on the flag, c10d's rendezvous semantics don't
+    # match up and the call deadlocks. For ranks covering the full
+    # world (all 2N ranks are members) the True/False distinction is
+    # otherwise equivalent — every rank participates either way — so
+    # this just keeps both sides honest.
+    logger.info(
+        "[colocate] %s rank %d: world.py creating sglang-paired world "
+        "new_groups (nccl + gloo on %d ranks) before meta_group",
+        role, role_rank, spec.world_size,
+    )
+    _ = dist.new_group(
+        ranks=all_world_ranks,
+        backend="nccl",
+        use_local_synchronization=True,
+    )
+    _ = dist.new_group(
+        ranks=all_world_ranks,
+        backend="gloo",
+        use_local_synchronization=True,
+    )
 
     fsdp_ranks = trainer_global_ranks(spec)
     if len(fsdp_ranks) >= 2:
@@ -288,7 +311,14 @@ def init_union_world(
         fsdp_group_for_role = None
 
     meta_group = dist.new_group(
-        ranks=all_world_ranks, backend="gloo"
+        ranks=all_world_ranks,
+        backend="gloo",
+        use_local_synchronization=True,
+    )
+    logger.info(
+        "[colocate] %s rank %d: world.py meta_group + paired-world "
+        "new_groups complete",
+        role, role_rank,
     )
 
     os.environ[UNION_WORLD_ENV_MARKER] = "1"
