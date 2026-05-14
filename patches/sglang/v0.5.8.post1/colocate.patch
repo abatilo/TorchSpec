@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,287 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -223,10 +223,9 @@ index 000000000..aba6359c1
 +    """Return ``True`` iff TorchSpec's env-var sentinel is set."""
 +    val = os.environ.get(_TRANSFER_MODE_ENV, "").lower()
 +    active = val == "nccl"
-+    print(
++    logger.warning(
 +        f"[TS-COLOCATE-TRACE pid={os.getpid()}] is_colocate_active: "
 +        f"{_TRANSFER_MODE_ENV}={val!r} -> active={active}",
-+        flush=True,
 +    )
 +    return active
 +
@@ -304,10 +303,9 @@ index 000000000..aba6359c1
 +    import torch
 +    import torch.distributed as dist
 +
-+    print(
++    logger.warning(
 +        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
 +        f"ENTRY tp_rank={tp_rank} local_rank={local_rank} backend={backend!r}",
-+        flush=True,
 +    )
 +
 +    env = read_colocate_env()
@@ -316,12 +314,11 @@ index 000000000..aba6359c1
 +            "init_union_default_pg called but colocate is not active. "
 +            "Check is_colocate_active() before calling."
 +        )
-+    print(
++    logger.warning(
 +        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
 +        f"read_colocate_env OK: world_size={env.world_size} "
 +        f"n_per_role={env.n_per_role} init_method={env.init_method} "
 +        f"timeout={env.timeout_minutes}min paired_trainer_rank={env.paired_trainer_rank}",
-+        flush=True,
 +    )
 +
 +    if dist.is_initialized():
@@ -352,13 +349,12 @@ index 000000000..aba6359c1
 +        env.init_method, env.timeout_minutes,
 +    )
 +
-+    print(
++    logger.warning(
 +        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
 +        f"CALLING dist.init_process_group(backend={backend!r}, "
 +        f"world_size={env.world_size}, rank={global_rank}, "
 +        f"init_method={env.init_method!r}, timeout={env.timeout_minutes}min) "
 +        f"-- this BLOCKS until trainer rank also reaches its init_union_world",
-+        flush=True,
 +    )
 +    dist.init_process_group(
 +        backend=backend,
@@ -367,11 +363,10 @@ index 000000000..aba6359c1
 +        init_method=env.init_method,
 +        timeout=timedelta(minutes=env.timeout_minutes),
 +    )
-+    print(
++    logger.warning(
 +        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
 +        f"dist.init_process_group RETURNED -- union world is up (rank={global_rank}/"
 +        f"{env.world_size})",
-+        flush=True,
 +    )
 +
 +    # Mark the union world as up so a subsequent
@@ -612,7 +607,7 @@ index d0ff3eb8d..cd98d9d3d 100644
  from sglang.srt.distributed.device_communicators.pynccl_allocator import (
      use_symmetric_memory,
  )
-@@ -782,21 +787,75 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -782,21 +787,72 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                      )
  
@@ -642,27 +637,24 @@ index d0ff3eb8d..cd98d9d3d 100644
 +            # 2N-rank world group, which is what downstream sglang
 +            # (allreduce, world barriers) expects. See
 +            # docs/colocate/sglang_patch.md and torchspec_colocate.py.
-+            print(
++            logger.warning(
 +                f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
 +                f"init_torch_distributed: about to dispatch on is_colocate_active()",
-+                flush=True,
 +            )
 +            if is_colocate_active():
-+                print(
++                logger.warning(
 +                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
 +                    f"init_torch_distributed: TAKING COLOCATE PATH",
-+                    flush=True,
 +                )
 +                colocate_env = init_union_default_pg(
 +                    tp_rank=self.tp_size * self.pp_rank + self.tp_rank,
 +                    local_rank=self.gpu_id,
 +                    backend=backend,
 +                )
-+                print(
++                logger.warning(
 +                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
 +                    f"init_torch_distributed: init_union_default_pg returned; "
 +                    f"calling init_distributed_environment to seed sglang's _WORLD",
-+                    flush=True,
 +                )
 +                init_distributed_environment(
 +                    backend=backend,
