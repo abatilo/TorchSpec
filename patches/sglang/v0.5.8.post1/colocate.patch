@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,354 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -425,6 +425,42 @@ index 000000000..aba6359c1
 +    return list(range(env.n_per_role, 2 * env.n_per_role))
 +
 +
++def rebuild_world_group_engine_only(env, local_rank, backend="nccl"):
++    """Rebuild sglang's ``_WORLD`` GroupCoordinator to span only the
++    engine ranks ``[N, 2N)`` instead of the full ``2N`` union world.
++
++    sglang's ``init_distributed_environment`` builds ``_WORLD`` from
++    ``torch.distributed.get_world_size()``, which under colocate is
++    the ``2N``-rank union world. But the trainer ranks ``[0, N)``
++    never run sglang code, so any sglang world-level collective —
++    e.g. ``get_available_gpu_memory(distributed=...,
++    cpu_group=get_world_group().cpu_group)`` right after
++    ``initialize_dp_attention``, or world barriers later — would hang
++    forever waiting for the trainer half.
++
++    This rebuilds ``_WORLD`` as an engine-only GroupCoordinator. The
++    ``dist.new_group`` calls inside ``init_world_group`` inherit the
++    ``use_local_synchronization=True`` monkey-patch installed by
++    :func:`init_union_default_pg`, so only the engine ranks
++    participate.
++    """
++    import sglang.srt.distributed.parallel_state as ps
++
++    engine_ranks = build_engine_tp_ranks(env)
++    if ps._WORLD is not None and ps._WORLD.world_size == len(engine_ranks):
++        return  # already engine-only
++    # Drop the (wrong) 2N-rank _WORLD and rebuild engine-only. The old
++    # GroupCoordinator's process groups leak, but this runs once per
++    # engine subprocess at startup, so the cost is negligible.
++    ps._WORLD = None
++    ps._WORLD = ps.init_world_group(engine_ranks, local_rank, backend)
++    logger.warning(
++        "[TS-COLOCATE-TRACE pid=%d] rebuilt sglang _WORLD as engine-only: "
++        "ranks=%s world_size=%d",
++        os.getpid(), engine_ranks, ps._WORLD.world_size,
++    )
++
++
 +def build_hidden_states_writer():
 +    """Return a TorchSpec NcclHiddenStatesConnector for the spec_training callback.
 +
@@ -626,7 +662,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
 index d0ff3eb8d..cd98d9d3d 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -58,6 +58,11 @@ from sglang.srt.distributed import (
+@@ -58,6 +58,12 @@ from sglang.srt.distributed import (
      set_mscclpp_all_reduce,
      set_torch_symm_mem_all_reduce,
  )
@@ -634,11 +670,12 @@ index d0ff3eb8d..cd98d9d3d 100644
 +    build_engine_tp_ranks,
 +    init_union_default_pg,
 +    is_colocate_active,
++    rebuild_world_group_engine_only,
 +)
  from sglang.srt.distributed.device_communicators.pynccl_allocator import (
      use_symmetric_memory,
  )
-@@ -782,21 +787,92 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -782,21 +787,105 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                      )
  
@@ -719,6 +756,19 @@ index d0ff3eb8d..cd98d9d3d 100644
 +                    f"init_torch_distributed: trainer-paired meta_group "
 +                    f"new_group(gloo, [0,{colocate_env.world_size})) "
 +                    f"completed"
++                )
++                # init_distributed_environment built sglang's _WORLD
++                # spanning the full 2N union world. Rebuild it
++                # engine-only [N, 2N) — otherwise sglang world-level
++                # collectives (get_available_gpu_memory's distributed
++                # memory sync, world barriers) hang waiting for the
++                # trainer ranks, which never run sglang code.
++                rebuild_world_group_engine_only(
++                    colocate_env, self.gpu_id, backend
++                )
++                logger.warning(
++                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
++                    f"init_torch_distributed: sglang _WORLD rebuilt engine-only",
 +                )
 +                initialize_model_parallel(
 +                    tensor_model_parallel_size=self.tp_size,
