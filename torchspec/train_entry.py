@@ -283,6 +283,30 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
 
 
+def _maybe_resolve_colocate_aux_layers(args) -> None:
+    """Auto-resolve aux_hidden_states_layers for Eagle3 colocate runs.
+
+    The colocate training loop sizes the NCCL hidden-states transfer
+    buffer up front, so it needs aux_hidden_states_layers on `args`
+    before the loop starts — unlike the disagg path there's no engine
+    round-trip to discover it. DFlash configs are already handled by
+    _validate_and_configure_dflash; this covers Eagle3, using the same
+    default the engine falls back to (sgl_engine resolves the identical
+    function when args.aux_hidden_states_layers is None) so both sides
+    agree on the tensor's last-dim.
+    """
+    if not is_mps_colocate(args):
+        return
+    if getattr(args, "aux_hidden_states_layers", None):
+        return
+    from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
+
+    args.aux_hidden_states_layers = get_default_eagle3_aux_layer_ids(args.target_model_path)
+    logger.info(
+        f"Colocate: auto-set aux_hidden_states_layers = {args.aux_hidden_states_layers}"
+    )
+
+
 def train_async_no_generation(args):
     """Entry point for Eagle3 online training.
 
@@ -360,6 +384,7 @@ def train_async_no_generation(args):
         args.draft_model_config_obj = draft_model_config
 
         _validate_and_configure_dflash(args, draft_model_config)
+        _maybe_resolve_colocate_aux_layers(args)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
     timer.begin_async("Dataset loading")
