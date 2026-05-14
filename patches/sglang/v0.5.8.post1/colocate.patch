@@ -136,7 +136,7 @@ new file mode 100644
 index 000000000..aba6359c1
 --- /dev/null
 +++ b/python/sglang/srt/distributed/torchspec_colocate.py
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,318 @@
 +"""TorchSpec colocate (MPS + NCCL) integration helpers.
 +
 +This module is the engine-process side of the contract documented in
@@ -367,6 +367,37 @@ index 000000000..aba6359c1
 +        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
 +        f"dist.init_process_group RETURNED -- union world is up (rank={global_rank}/"
 +        f"{env.world_size})",
++    )
++
++    # Defang sglang's subsequent `dist.new_group` calls so they don't
++    # deadlock against the trainer's union-world setup.
++    #
++    # sglang's GroupCoordinator.__init__ creates per-engine TP/EP/PP/MoE
++    # subgroups via `dist.new_group(ranks=[engine_ranks], ...)`. By
++    # default, dist.new_group is a *world-collective* call — every rank
++    # in the world group must call it with the same args, even if not
++    # in `ranks`. In colocate mode the trainer ranks [0, N) are NOT
++    # sglang ranks and have no business participating in sglang's
++    # subgroup setup; they're busy creating the union-world meta_group.
++    # The mismatch deadlocks both sides at the first collective
++    # boundary.
++    #
++    # Setting `use_local_synchronization=True` on each new_group call
++    # makes it a member-only barrier — non-member ranks skip it
++    # entirely. We do this via a thin wrapper around dist.new_group
++    # that only applies inside this engine subprocess; the trainer is a
++    # different process and is unaffected.
++    _original_new_group = dist.new_group
++
++    def _local_only_new_group(*args, **kwargs):
++        kwargs.setdefault("use_local_synchronization", True)
++        return _original_new_group(*args, **kwargs)
++
++    dist.new_group = _local_only_new_group
++    logger.warning(
++        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
++        f"installed local-only new_group default to break "
++        f"world-collective deadlock with the trainer"
 +    )
 +
 +    # Mark the union world as up so a subsequent
