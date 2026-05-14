@@ -1077,3 +1077,221 @@ no longer leaks when the script returns normally.
 None of these touched the colocate code path itself — pure runner +
 report-back hardening so the next agent gets actionable signal
 faster.
+
+---
+
+## RunPod validation session (2026-05-13)
+
+First end-to-end attempt to run the cheap-host smoke on a *real* MPS-capable
+host (RunPod community/secure pods). Goal: validate `test_colocate_tiny.py`
+on 1×GPU, then move to 4×H100 for the full Phase-4/6/7 matrix.
+
+Tooling: orchestration was done via `runpodctl` (Go CLI, brew-installed)
+rather than the web UI, so each step is a discrete API call —
+`pod create` → `pod get` (poll for SSH info) → `ssh ... 'bash -s' <
+bootstrap.sh` (one-shot batched, no interactive latency) → `scp` artifacts
+→ `pod stop && pod delete`. A throwaway ed25519 key was registered on the
+account via `runpodctl ssh add-key` and removed at the end.
+
+### Run 1 — A100 SXM 80GB community ($1.39/hr, $0.27 spent)
+
+First attempt. Outcomes layered:
+
+| Layer | Outcome |
+|---|---|
+| Pod provisioning + SSH bootstrap | ✅ runner clones fork, applies sglang patches, pip-installs |
+| Pre-flight (nvidia-smi, MPS daemon, MPS probe) | ✅ `mps_works: True — ok`; MPS server spawns under `--ipc=host` from the `runpod-torch-v240` template |
+| `pytest` collect + first test entry | ✅ |
+| **`python -m torchspec.train_entry` import chain** | ❌ `ImportError: libibverbs.so.1: cannot open shared object file` |
+
+The failure traced through `train_entry → trainer_actor → eagle3_trainer
+→ trainer → torchspec.transfer.mooncake.eagle_store →
+torchspec.transfer.mooncake.store → from mooncake.store import
+MooncakeDistributedStore`. `mooncake.store`'s native `.so` is statically
+linked against the RDMA verbs userspace stack (libibverbs, libnuma,
+librdmacm, libnl-3) which `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
+does not ship. Modal sandbox happened to include them.
+
+**Architectural surprise:** the colocate design says `transfer_mode=nccl`
+is **Mooncake-free**, but the top-level `from mooncake.store import
+MooncakeDistributedStore` in `torchspec/transfer/mooncake/store.py` is
+unconditional — it fires at module-load time regardless of config, so the
+import chain blows up *before* the runtime config is ever read.
+
+**Fix landed as commit `3f7e708`:**
+`torchspec/transfer/mooncake/store.py` now wraps that single load-bearing
+import in try/except and defines a `MooncakeDistributedStore` stub on
+failure. The stub satisfies the `Optional[MooncakeDistributedStore]` type
+annotation on `_store` and raises a `RuntimeError` with an actionable
+`apt-get install libibverbs1 libnuma1 librdmacm1 libnl-3-200` hint if the
+disagg path tries to instantiate it at runtime. The
+`_build_replicate_config`'s lazy `from mooncake.store import
+ReplicateConfig` (line ~300) was already this shape — we extend the
+pattern to the remaining top-level import.
+
+Trade-off: existing Mooncake users with missing libs now see
+`RuntimeError` at `setup()` time instead of `ImportError` at module load.
+Strictly more actionable (apt-get hint) and the failure window shifts by
+seconds, not minutes.
+
+After Phase-A2 retry with `apt-get install -y libibverbs1` preemptively,
+we hit `libnuma.so.1: cannot open shared object file` — same import
+chain, next transitive dep. That confirmed we'd be playing whack-a-mole
+through Mooncake's RDMA stack, which is why the lazy-import fix is the
+right shape: future RunPod-class hosts don't need *any* of those libs to
+run the colocate path.
+
+Continuing on the A100 after the lazy-import fix, `train_entry` now
+reached the SglEngine actor init and got as far as `sgl.Engine(...)`,
+where it crashed in `sgl_kernel.__init__` because the pre-built wheel
+(`sgl_kernel 0.3.21`) ships only `sm90/common_ops.abi3.so` and
+`sm100/common_ops.abi3.so` — **no `sm80`** for the A100. See the next
+section for the SM-gap analysis.
+
+### Run 2 — H100 PCIe SECURE ($2.39/hr, ~$1.13 spent)
+
+Switched GPU shape to get into a sgl_kernel-supported arch. A100 (sm80)
+and A6000 (sm86) are both unsupported by the current sgl_kernel wheel
+because the wheel author's CI dropped Ampere builds even though the
+CMake source lists them as optional below-SM90 architectures (see
+`sgl-kernel/CMakeLists.txt`'s `gencode arch=compute_80,code=sm_80`
+entry). Lambda Ada (sm89 — L40S, RTX 4090) also missing from the wheel.
+Practical conclusion: the supported single-GPU "cheap host" set is
+**sm90+ only** (H100, H200, B200). The earlier cheap-host plan that
+recommended A6000 as the default needs updating (deferred to a doc
+commit alongside this log entry).
+
+Stock note: A100 SXM was the only "Medium" stock single-GPU we found on
+community cloud; everything else was "Low". H100 community was dry on
+both attempts; SECURE H100 PCIe rented at $2.39/hr immediately.
+
+With libibverbs1 installed (preemptive belt-and-braces; not actually
+needed thanks to commit `3f7e708`) and the lazy-import fix in the
+checkout, `train_entry` progressed:
+
+```
+✅ MPS daemon ready (pre-Ray start, started_by_us=False, pipe_dir=/tmp/nvidia-mps)
+✅ Ray cluster up (1 GPU)
+✅ Placement group created (strategy=mps, bundle 0 on local node)
+✅ AsyncTrainingController: dataset tokenized (1000 samples)
+✅ Driver: union rendezvous configured → tcp://172.20.0.2:25721 (world_size=2, timeout=10min)
+✅ Engine factory: 1 SglEngine actor spawned with pre-allocated ports 10000/10001
+✅ SglEngine rank 0: union env propagated, transfer_mode=nccl, paired_trainer_rank=0
+✅ SglEngine rank 0: BEFORE init - base_gpu_id=0, num_gpus=1, tp_size=1, ...
+…then 14 minutes of silence, then pytest's 15-minute timeout fires.
+```
+
+The hang is somewhere after `sgl.Engine(**engine_kwargs)` is called but
+before its TP scheduler subprocess reports ready. Crucially, *no log
+output* from either the trainer actor or the engine subprocess for those
+14 minutes — even though Ray spawned both, MPS shows both as ACTIVE
+clients, and neither has died.
+
+### Logger silence — the reason "where is it stuck?" had no signal
+
+Investigation of why we couldn't see what either side was doing surfaced
+a separate bug: every module under `torchspec/colocate/`,
+`torchspec/training/nccl_data_fetcher.py`, and
+`torchspec/inference/engine/nccl_hidden_states_connector.py` creates its
+logger via `logging.getLogger("torchspec.X.Y")` rather than importing
+the central `logger` from `torchspec.utils.logging`. Those child loggers
+inherit from the root logger, which defaults to `WARNING` — so every
+`logger.info(...)` in `world.py::init_union_world`,
+`mps.py::start_mps_daemon`, the NCCL fetcher, and the engine-side
+connector is silently dropped.
+
+`setup_logger()` in `torchspec/utils/logging.py` configures a logger named
+`TorchSpec` (or `TorchSpec-{actor_name}`) — completely separate from the
+lowercase `torchspec` hierarchy. So configuration *and* runtime
+production were happening in parallel logger trees that never met.
+
+**Fix landed as commit `0089ad3`:** `setup_logger()` now also attaches
+the same handler to `logging.getLogger("torchspec")` (with
+`propagate=False` and a guard against duplicate handlers). All child
+loggers in the `torchspec.X.Y` hierarchy inherit via standard
+propagation, so previously-invisible INFO logs become visible in
+actor stdout/stderr. Submodule callsites unchanged.
+
+### Run 3 — H100 SXM SECURE diagnostic ($2.99/hr, ~$1.41 spent)
+
+Same shape as Run 2 but with the logger fix in the checkout and
+`NCCL_DEBUG=INFO`, `NCCL_DEBUG_SUBSYS=INIT,COLL` exported by the
+bootstrap. New visibility:
+
+```
+[TrainerActor pid=3392] world.py:227 INFO Initialising union world: role=training
+  role_rank=0 global_rank=0 paired_global_rank=1 world_size=2
+  init_method=tcp://172.20.0.2:25721 device=cuda:0
+[SglEngine pid=3461]    sgl_engine.py:296 INFO BEFORE init - base_gpu_id=0, num_gpus=1, ...
+[SglEngine pid=3461]    <6× cuda.cudart / cuda.nvrtc deprecation warnings>
+… 14 minutes of silence …
+```
+
+Three new signals:
+
+1. **Trainer actually calls `init_union_world`** and blocks at
+   `dist.init_process_group`. Confirmed by the world.py:227 log,
+   the very next line of code being the rendezvous call, and the
+   subsequent silence.
+2. **NCCL never starts on either side.** With `NCCL_DEBUG=INFO`, NCCL
+   emits ~50 lines of init output once the c10d backend is brought up
+   (NIC selection, channel setup, peer connect). We see zero NCCL_INFO
+   lines anywhere in the captured log. NCCL_INFO only fires *after*
+   the TCPStore rendezvous completes, so both sides are stuck *before*
+   NCCL initialises.
+3. **The engine's TP scheduler subprocess does start** (MPS server log
+   shows new client PID joining as "ACTIVE" ~24 s after `sgl.Engine()`
+   is called) but produces no further output beyond the cuda
+   deprecation warnings emitted during imports.
+
+The remaining hypothesis: the patched sglang's `init_union_default_pg`
+(in `sglang.srt.distributed.torchspec_colocate`) and the
+`Scheduler.__init__`/`ModelRunner` colocate branches use
+`logger.info(...)` where `logger = logging.getLogger(__name__)` — that
+namespace is **sglang's, not torchspec's**, so our torchspec-namespace
+fix doesn't help. *And* `torchspec/inference/engine/sgl_engine.py:309`
+passes `"log_level": "warning"` into `sgl.Engine(**engine_kwargs)`,
+which configures sglang's global logger at WARNING — so the patched
+init log lines would be silenced inside the TP scheduler subprocess
+*regardless* of namespace.
+
+That means we still don't know whether the TP scheduler is:
+(a) stuck before reaching `init_union_default_pg`, or
+(b) reached it and stuck in `dist.init_process_group` (TCPStore rendezvous
+    can hang forever on its own — its `timeout` arg only applies to
+    collectives after init, not the initial rendezvous in PyTorch 2.9.x), or
+(c) crashed silently after some hidden exception that wasn't caught and
+    reported to the parent.
+
+### Action items for the next iteration
+
+1. Make `sgl.Engine`'s `log_level` env-overridable (default
+   "warning" preserved for production; `SGLANG_LOG_LEVEL` env override
+   for debug runs). Lets us surface the patched sglang's INFO logs
+   without a code change every time.
+2. Add unconditional `print(..., flush=True)` instrumentation to the
+   colocate patch at the entry of `init_union_default_pg`, immediately
+   before `dist.init_process_group`, and at the colocate branch entry
+   of `Scheduler.__init__` / `ModelRunner.init_torch_distributed`. The
+   prints bypass Python logging entirely so they survive any
+   sglang/log-level config and any silent exception handling.
+3. Re-run on H100 with the instrumentation. The captured output will
+   distinguish (a) vs (b) vs (c).
+4. Independently, document the SM89/SM90+ GPU requirement in the
+   cheap-host test plan (the original "1× RTX A6000 48 GB
+   (Recommended)" tier is unusable with the bundled sgl_kernel wheel).
+
+### Net at end of session
+
+| Outcome | Status |
+|---|---|
+| `runpodctl`-based orchestration end-to-end | ✅ |
+| Runner pre-flight + MPS daemon + auto-report on real H100 | ✅ |
+| Lazy-import fix for mooncake unblocks colocate code path (3f7e708) | ✅ |
+| Logger visibility for `torchspec.X.Y` namespace (0089ad3) | ✅ |
+| Phase 1 (placement + MPS env) + Phase 2 (union NCCL world setup) confirmed at runtime | ✅ |
+| `test_phase4_tiny_one_step` end-to-end PASS | ❌ — TP scheduler subprocess hangs before reaching `init_union_default_pg` (or while inside it). Logger visibility gap means we can't yet tell which. |
+
+Total session spend: ~$2.83 across two A100 runs + two H100 runs + a
+brief leaked-pod incident ($0.02, caught in seconds by the next
+`pod list`).

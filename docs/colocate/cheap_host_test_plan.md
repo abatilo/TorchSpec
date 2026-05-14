@@ -62,20 +62,45 @@ correctness check.
 
 Pick the cheapest tier that satisfies your validation goal.
 
+**GPU compatibility requirement: SM89 or newer (Ada / Hopper / Blackwell).**
+The pre-built `sgl_kernel 0.3.21` wheel that the runner installs only
+ships `sm90` (Hopper) and `sm100` (Blackwell) binaries — Ada (sm89) and
+Ampere (sm80/sm86) variants are missing. Practical implication: **A100,
+A6000, RTX 3090, RTX A5000, RTX 4090, L40S, and RTX 6000 Ada will NOT
+load `sgl_kernel.common_ops` at engine startup.** This was originally
+covered in the test plan as "RTX A6000 (Recommended)" — that line is now
+struck through. Confirmed empirically on RunPod 2026-05-13; see
+`docs/colocate/implementation_log.md` §"RunPod validation session"
+for the wheel layout. Workaround is to build `sgl_kernel` from source on
+the host (~20-min compile, needs CUDA toolkit), or use a sm90+ GPU.
+
 | Goal | Recommended host | $/hr | One pass | Tests run |
 |---|---|---|---|---|
-| Tiny correctness only | 1×L40S 48 GB on **Vast.ai** | ~$0.50 | ~25 min | tiny one-step + tiny convergence |
-| Tiny correctness only | 1×A6000 48 GB / 1×4090 24 GB on **Vast.ai** | ~$0.40 | ~25 min | same |
-| Tiny + headroom | 1×H100 80 GB on **Vast.ai** spot | ~$2.00 | ~25 min | same (with room for full Qwen3-8B) |
-| Tiny + headroom | 1×H100 80 GB on **RunPod** community | ~$2.50 | ~25 min | same |
+| Tiny correctness only | 1×H100 PCIe 80 GB on **RunPod** SECURE | ~$2.39 | ~30 min | tiny one-step + tiny convergence |
+| Tiny correctness only | 1×H100 PCIe 80 GB on **RunPod** community (if available) | ~$2.50 | ~30 min | same |
+| Tiny correctness only | 1×H100 SXM5 80 GB on **RunPod** SECURE | ~$2.99 | ~30 min | same |
+| Tiny correctness only | 1×H100 80 GB on **Vast.ai** spot | ~$2.00 | ~25 min | same (with room for full Qwen3-8B) |
 | Full Phase-4/6/7 | 4×H100 80 GB on **Hyperstack** | ~$8/hr | ~90 min | all five test files |
 | Full Phase-4/6/7 | 4×H100 on **Lambda Labs** spot | ~$10/hr | ~90 min | all five test files |
-| Full Phase-4/6/7 | 4×H100 on **RunPod** community | ~$12/hr | ~90 min | all five test files |
+| Full Phase-4/6/7 | 4×H100 SXM on **RunPod** community | ~$10–12/hr | ~90 min | all five test files |
 
-Vast.ai is consistently the cheapest because it's a marketplace.
+~~Tiny correctness only | 1×L40S 48 GB on Vast.ai | ~$0.50~~ — sm89 not supported by bundled sgl_kernel wheel.
+~~Tiny correctness only | 1×A6000 48 GB / 1×4090 24 GB on Vast.ai | ~$0.40~~ — sm80/sm86 not supported either.
+
 **Important: pick a Vast.ai or RunPod template that has Docker support
 with `--ipc=host` enabled.** Most "PyTorch" templates default to this;
-look for "shared IPC" or "interactive" mode in the rental UI.
+look for "shared IPC" or "interactive" mode in the rental UI. On RunPod
+the `runpod-torch-v240` template is confirmed working.
+
+**Runner orchestration tip:** drive provisioning with `runpodctl`
+(brew-installed; `runpodctl doctor` for auth setup) rather than the web
+UI. Each step is a discrete API call so the loop is
+`pod create → ssh -i ... 'bash -s' < bootstrap.sh → scp report → pod delete`.
+The H100 PCIe `gpu-id` is the literal string `'NVIDIA H100 PCIe'` (NOT
+`'NVIDIA H100 80GB HBM3'` which is the SXM variant). When `pod create`
+hits "no instances available", DO NOT retry in a tight loop without
+sleep — partial successful responses can race and you'll get multiple
+charged pods. Always confirm with `runpodctl pod list` immediately.
 
 ---
 
@@ -83,10 +108,24 @@ look for "shared IPC" or "interactive" mode in the rental UI.
 
 The runner script aborts with exit code 1 if any of these are missing:
 
-1. `nvidia-smi` reports at least 1 GPU with CUDA capability ≥ 8.0
-   (Ampere/Ada/Hopper). 24 GB VRAM is enough for the tiny config.
+1. `nvidia-smi` reports at least 1 GPU with CUDA capability ≥ **9.0**
+   (Hopper / Blackwell). The bundled `sgl_kernel 0.3.21` wheel doesn't
+   ship Ada (sm89) or Ampere (sm80/sm86) variants, so realistically
+   only H100/H200/B200 GPUs work without a source build. 80 GB VRAM is
+   plenty for the tiny config; minimum 24 GB if you happen to find a
+   sm90+ card with less RAM.
 2. `nvidia-cuda-mps-control` is on `$PATH` (ships with the CUDA
    toolkit; almost always pre-installed on rental images).
+3. **`libnuma.so.1` available system-wide** for `sgl_kernel`'s native
+   `common_ops.abi3.so` to dlopen at engine startup. RunPod's stock
+   `runpod-torch-v240` image does *not* ship this; the runner's
+   bootstrap installs it via `apt-get install -y libnuma1`. If you
+   roll your own bootstrap on a fresh image, do the same — without
+   it, `sgl.Engine(...)` will crash with
+   `ImportError: libnuma.so.1: cannot open shared object file`.
+   (You no longer need `libibverbs1` / `librdmacm1` / `libnl-3-200`
+   for the colocate path — commit `3f7e708` made the Mooncake
+   imports lazy, so only the disagg path needs the RDMA verbs stack.)
 3. Container runtime passes `--ipc=host` (or you're on a bare VM).
    On Vast.ai this is the default for "On-Demand" instances; on RunPod
    it's the default for "Pods" but **not** for "Serverless" endpoints.
