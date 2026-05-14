@@ -167,14 +167,19 @@ class TrainerActor(RayActor):
             )
 
         if is_colocate_nccl:
-            # init_union_world already built an all-rank gloo subgroup
-            # (meta_group). Bind it as the module-global GLOO_GROUP so
-            # downstream get_gloo_group() returns it. This avoids
-            # creating yet another gloo group on the 2N-rank union
-            # world, which would trigger an extra TCP rendezvous.
+            # Bind GLOO_GROUP to the **trainer-only** gloo subgroup, NOT
+            # the 2N-rank meta_group. Downstream eagle3_trainer.py /
+            # dflash_trainer.py call `dist.barrier(group=get_gloo_group())`
+            # after rank-0-only state-dict loads to sync the trainer
+            # replicas. If that barrier were on meta_group (which
+            # includes the engine), the trainer would block forever
+            # because the engine never enters the trainer's
+            # init_model code path. Validated empirically on RunPod
+            # H100 SXM iter 10 — see implementation_log.md §"RunPod
+            # debug session #2".
             from torchspec.utils import distributed as _dist_utils
 
-            _dist_utils.GLOO_GROUP = self._union_world.meta_group
+            _dist_utils.GLOO_GROUP = self._union_world.trainer_gloo_group
 
             # In colocate mode, the default PG is the 2N-rank union
             # world, but FSDP / per-trainer code assumes

@@ -64,6 +64,10 @@ class Eagle3Trainer(Trainer):
 
         init_context = self._get_init_weight_context_manager()
 
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE AutoEagle3DraftModel.from_config"
+        )
         with init_context():
             draft_model = AutoEagle3DraftModel.from_config(
                 draft_model_config,
@@ -71,6 +75,10 @@ class Eagle3Trainer(Trainer):
                 torch_dtype=torch.bfloat16,
             )
 
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE draft_model.load_embedding (rank-0 only)"
+        )
         if dist.get_rank() == 0:
             draft_model.load_embedding(
                 target_model_path,
@@ -79,7 +87,16 @@ class Eagle3Trainer(Trainer):
 
         draft_model.freeze_embedding()
 
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE dist.barrier(get_gloo_group()) "
+            "-- gloo_group should be trainer-only, not union meta_group"
+        )
         dist.barrier(group=get_gloo_group())
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: AFTER dist.barrier(get_gloo_group()) -- barrier RETURNED"
+        )
 
         frozen_count = sum(p.numel() for p in draft_model.parameters() if not p.requires_grad)
         trainable_count = sum(p.numel() for p in draft_model.parameters() if p.requires_grad)
@@ -102,6 +119,10 @@ class Eagle3Trainer(Trainer):
             for name, m in eagle3_model.named_modules()
             if isinstance(m, torch.nn.Linear) and "midlayer" in name
         ]
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE apply_fsdp2"
+        )
         eagle3_model = apply_fsdp2(
             eagle3_model,
             mesh=self.grad_sync_mesh,
@@ -109,12 +130,20 @@ class Eagle3Trainer(Trainer):
             args=self.args,
             modules_to_shard=midlayer_modules,
         )
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: AFTER apply_fsdp2 -- BEFORE fsdp2_load_full_state_dict"
+        )
 
         eagle3_model = fsdp2_load_full_state_dict(
             eagle3_model,
             full_state,
             self.grad_sync_mesh,
             cpu_offload=True if self.fsdp_cpu_offload else None,
+        )
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: AFTER fsdp2_load_full_state_dict"
         )
 
         self.model = eagle3_model

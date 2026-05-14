@@ -156,6 +156,16 @@ class UnionWorld:
     meta_group: object  # torch.distributed.ProcessGroup
     """Gloo subgroup spanning all 2N ranks. Used for CPU-side step
     metadata broadcast (cheap dict broadcast, no GPU needed)."""
+    trainer_gloo_group: object  # torch.distributed.ProcessGroup
+    """Gloo subgroup of just trainer ranks ``[0, N)``. Bound to
+    :data:`torchspec.utils.distributed.GLOO_GROUP` in trainer_actor so
+    that ``dist.barrier(group=get_gloo_group())`` calls (e.g.
+    eagle3_trainer.py line 82, dflash_trainer.py line 113) sync only
+    the trainer half of the union world. Using ``meta_group`` here
+    would block on the engine, which never enters trainer-side
+    barriers. Set to ``None`` on engine ranks (engines don't use it).
+    For 1-trainer runs this is a 1-rank gloo group — gloo handles
+    1-rank groups cleanly, unlike NCCL."""
 
 
 def init_union_world(
@@ -315,9 +325,28 @@ def init_union_world(
         backend="gloo",
         use_local_synchronization=True,
     )
+
+    # Trainer-only gloo group for trainer-side barriers. Engine ranks
+    # don't need to participate; we pass use_local_synchronization=True
+    # so they skip the call entirely. On engine ranks the local handle
+    # is discarded (set to None on the returned UnionWorld). For
+    # 1-trainer runs this is a 1-rank gloo group — gloo handles
+    # 1-rank groups cleanly (unlike NCCL where 1-rank groups can hang
+    # at eager init).
+    trainer_only_gloo = dist.new_group(
+        ranks=trainer_global_ranks(spec),
+        backend="gloo",
+        use_local_synchronization=True,
+    )
+    trainer_gloo_for_role: Optional[object]
+    if role == ROLE_TRAINER:
+        trainer_gloo_for_role = trainer_only_gloo
+    else:
+        trainer_gloo_for_role = None
+
     logger.info(
         "[colocate] %s rank %d: world.py meta_group + paired-world "
-        "new_groups complete",
+        "+ trainer_gloo_group new_groups complete",
         role, role_rank,
     )
 
@@ -331,6 +360,7 @@ def init_union_world(
         paired_global_rank=paired_global_rank,
         fsdp_group=fsdp_group_for_role,
         meta_group=meta_group,
+        trainer_gloo_group=trainer_gloo_for_role,
     )
 
 

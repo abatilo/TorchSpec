@@ -154,15 +154,29 @@ class Trainer(abc.ABC):
         self.dp_rank = rank
 
         if world_size < dist_world_size:
-            # Colocate sub-world: build a trainer-only NCCL sub-group
-            # and an attached mesh so FSDP collectives stay within the
-            # trainer slice and never reach the engine ranks.
+            # Colocate sub-world: build a trainer-only sub-group and an
+            # attached mesh so FSDP collectives stay within the trainer
+            # slice and never reach the engine ranks.
+            #
             # use_local_synchronization=True so the engine subprocesses
             # (non-members) don't need to participate in the call.
+            #
+            # Backend: NCCL for >=2 trainers (real GPU collectives).
+            # For the 1-trainer tiny case, we deliberately use GLOO
+            # because NCCL has a well-known eager-init / pynccl hang on
+            # 1-rank groups (the original world.py comment flagged this
+            # exact issue). FSDP on a 1-rank mesh does no actual
+            # cross-rank collectives — it just stores params unsharded
+            # — so the backend choice doesn't affect correctness; it
+            # just keeps the rendezvous side cheap and hang-free.
             trainer_ranks = list(range(world_size))
+            if world_size >= 2:
+                trainer_backend = "nccl"
+            else:
+                trainer_backend = "gloo"
             trainer_pg = dist.new_group(
                 ranks=trainer_ranks,
-                backend="nccl",
+                backend=trainer_backend,
                 use_local_synchronization=True,
             )
             from torch.distributed.device_mesh import DeviceMesh
@@ -171,7 +185,7 @@ class Trainer(abc.ABC):
                 trainer_pg, "cuda", mesh_dim_names=("dp",)
             )
             self.dp_group = trainer_pg
-            mesh_kind = "1D-colocate-sub"
+            mesh_kind = f"1D-colocate-sub({trainer_backend})"
         else:
             self.mesh = init_device_mesh(
                 "cuda",
@@ -187,6 +201,13 @@ class Trainer(abc.ABC):
             f"[Rank {rank}] Device mesh ({mesh_kind}): "
             f"world_size={world_size}, dp_size={self.dp_size}, "
             f"dist_world_size={dist_world_size}"
+        )
+        # Heavy instrumentation for post-mesh hang diagnosis: log at
+        # every transition between init phases. (See
+        # docs/colocate/implementation_log.md §"RunPod debug session
+        # #2" for why this is here.)
+        logger.warning(
+            f"[Rank {rank}] [TS-COLOCATE-TRACE-T] _setup_device_mesh DONE"
         )
 
     def _get_init_weight_context_manager(self):
