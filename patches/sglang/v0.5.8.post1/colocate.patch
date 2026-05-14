@@ -638,7 +638,7 @@ index d0ff3eb8d..cd98d9d3d 100644
  from sglang.srt.distributed.device_communicators.pynccl_allocator import (
      use_symmetric_memory,
  )
-@@ -782,21 +787,88 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -782,21 +787,92 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                      )
  
