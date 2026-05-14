@@ -221,7 +221,14 @@ index 000000000..aba6359c1
 +
 +def is_colocate_active() -> bool:
 +    """Return ``True`` iff TorchSpec's env-var sentinel is set."""
-+    return os.environ.get(_TRANSFER_MODE_ENV, "").lower() == "nccl"
++    val = os.environ.get(_TRANSFER_MODE_ENV, "").lower()
++    active = val == "nccl"
++    print(
++        f"[TS-COLOCATE-TRACE pid={os.getpid()}] is_colocate_active: "
++        f"{_TRANSFER_MODE_ENV}={val!r} -> active={active}",
++        flush=True,
++    )
++    return active
 +
 +
 +def read_colocate_env() -> Optional[ColocateEnv]:
@@ -297,12 +304,25 @@ index 000000000..aba6359c1
 +    import torch
 +    import torch.distributed as dist
 +
++    print(
++        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
++        f"ENTRY tp_rank={tp_rank} local_rank={local_rank} backend={backend!r}",
++        flush=True,
++    )
++
 +    env = read_colocate_env()
 +    if env is None:
 +        raise RuntimeError(
 +            "init_union_default_pg called but colocate is not active. "
 +            "Check is_colocate_active() before calling."
 +        )
++    print(
++        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
++        f"read_colocate_env OK: world_size={env.world_size} "
++        f"n_per_role={env.n_per_role} init_method={env.init_method} "
++        f"timeout={env.timeout_minutes}min paired_trainer_rank={env.paired_trainer_rank}",
++        flush=True,
++    )
 +
 +    if dist.is_initialized():
 +        # Already up — most likely because the trainer and this engine
@@ -332,12 +352,26 @@ index 000000000..aba6359c1
 +        env.init_method, env.timeout_minutes,
 +    )
 +
++    print(
++        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
++        f"CALLING dist.init_process_group(backend={backend!r}, "
++        f"world_size={env.world_size}, rank={global_rank}, "
++        f"init_method={env.init_method!r}, timeout={env.timeout_minutes}min) "
++        f"-- this BLOCKS until trainer rank also reaches its init_union_world",
++        flush=True,
++    )
 +    dist.init_process_group(
 +        backend=backend,
 +        world_size=env.world_size,
 +        rank=global_rank,
 +        init_method=env.init_method,
 +        timeout=timedelta(minutes=env.timeout_minutes),
++    )
++    print(
++        f"[TS-COLOCATE-TRACE pid={os.getpid()}] init_union_default_pg: "
++        f"dist.init_process_group RETURNED -- union world is up (rank={global_rank}/"
++        f"{env.world_size})",
++        flush=True,
 +    )
 +
 +    # Mark the union world as up so a subsequent
@@ -608,11 +642,27 @@ index d0ff3eb8d..cd98d9d3d 100644
 +            # 2N-rank world group, which is what downstream sglang
 +            # (allreduce, world barriers) expects. See
 +            # docs/colocate/sglang_patch.md and torchspec_colocate.py.
++            print(
++                f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
++                f"init_torch_distributed: about to dispatch on is_colocate_active()",
++                flush=True,
++            )
 +            if is_colocate_active():
++                print(
++                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
++                    f"init_torch_distributed: TAKING COLOCATE PATH",
++                    flush=True,
++                )
 +                colocate_env = init_union_default_pg(
 +                    tp_rank=self.tp_size * self.pp_rank + self.tp_rank,
 +                    local_rank=self.gpu_id,
 +                    backend=backend,
++                )
++                print(
++                    f"[TS-COLOCATE-TRACE pid={os.getpid()}] ModelRunner."
++                    f"init_torch_distributed: init_union_default_pg returned; "
++                    f"calling init_distributed_environment to seed sglang's _WORLD",
++                    flush=True,
 +                )
 +                init_distributed_environment(
 +                    backend=backend,

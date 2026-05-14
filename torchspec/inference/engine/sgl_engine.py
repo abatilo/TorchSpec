@@ -304,8 +304,15 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         # Overridable defaults (e.g. log_level) are set first so that
         # extra_args can override them; protected keys are set after
         # extra_args and cannot be overridden.
+        #
+        # log_level: default "warning" so production runs stay quiet, but
+        # the SGLANG_LOG_LEVEL env override lets a debug run crank it up
+        # without code changes. The colocate path's patched
+        # init_union_default_pg + Scheduler.__init__ branch use logger.info
+        # under sglang's namespace, which is silenced at WARNING and
+        # invisible when diagnosing a TP-scheduler-subprocess hang.
         engine_kwargs = {
-            "log_level": "warning",
+            "log_level": os.environ.get("SGLANG_LOG_LEVEL", "warning"),
         }
 
         # Apply extra_args (can override defaults above, but not protected keys)
