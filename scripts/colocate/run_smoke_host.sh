@@ -262,17 +262,20 @@ if "_ts_offset" in src:
     sys.exit(0)
 
 inject = (
-    "    # TorchSpec colocate: shift attn_tp group ranks by N\n"
-    "    # (engine_global_rank_base) so engine ranks land in the\n"
-    "    # union-world slice [N, 2N). Default 0 keeps non-colocate\n"
-    "    # runs byte-identical.\n"
+    "    # TorchSpec colocate: a tp_size=1 engine's attn_tp group is the\n"
+    "    # singleton [engine_union_rank]; sglang computes [head] (-> [0]),\n"
+    "    # so shift by THIS engine's own union rank (N +\n"
+    "    # paired_trainer_rank), not just N -- otherwise only engine 0\n"
+    "    # passes the GroupCoordinator membership check. Default 0 keeps\n"
+    "    # non-colocate runs byte-identical.\n"
     "    try:\n"
     "        from sglang.srt.distributed.torchspec_colocate import (\n"
     "            is_colocate_active,\n"
     "            read_colocate_env,\n"
     "        )\n"
     "        _ts_offset = (\n"
-    "            read_colocate_env().n_per_role if is_colocate_active() else 0\n"
+    "            read_colocate_env().engine_global_rank()\n"
+    "            if is_colocate_active() else 0\n"
     "        )\n"
     "    except Exception:\n"
     "        _ts_offset = 0\n"
@@ -287,7 +290,7 @@ new_src = new_src.replace(
 )
 assert new_src != src, "dp_attention.py: no substitution made"
 target.write_text(new_src)
-print(f"[dp_attention] patched {target}: +14 offset lines, 1 range() rewrite")
+print(f"[dp_attention] patched {target}: _ts_offset inject + range() rewrite")
 PYEOF
 
   # Post-patch surgery #2: tp_worker.py's broadcast_pyobj callsite for
