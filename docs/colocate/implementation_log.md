@@ -1444,3 +1444,51 @@ Provision 4×H100 and run `--full` for the remaining MPS-gated tests:
 The 4-GPU union world has two ranks per GPU on *four* GPUs — the gloo
 `meta_group` routing handles this identically, but FSDP across the
 4-trainer NCCL subgroup gets its first real (≥2-rank) exercise there.
+
+---
+
+## Vast debug session #4 (2026-05-14/15, 4×H100 runs #1-#7) — full suite GREEN
+
+Ran the `--full` suite on a 4×H100 SXM Vast instance (`36786680`,
+~$10.71/hr). Runs #1-#4 cleared four N=1-coincidence init bugs (the
+tiny smoke is dp_size=1, so anything that only misbehaves at mesh
+size ≥ 2 had been invisible). Runs #5-#6 were lost to the pod being
+stopped mid-run — on restart the disk persists, so each relaunch
+just re-clones and re-runs. Run #7 went green end-to-end.
+
+### Iter chain — what each fix unblocked
+
+| Run | Commit | What surfaced | Fix |
+|---|---|---|---|
+| 1-2 | 33b7e26 | Engine union-world rank computed from `tp_rank`; correct only at N=1 | Compute the engine union-world rank for N>1. |
+| 3 | a5a0288 | `fsdp_group` `new_group` desynced the shared new-group counter — ranks disagreed on which group was which | Create all shared `new_group`s before the role-restricted ones, so every union rank walks the same creation order. |
+| 4 | 058871d | `dp_attention` surgery shifted the rank by `N` instead of the engine's own union rank | Offset by the engine's own union rank. |
+| 5-6 | — | (no code change — pod was stopped mid-run twice; restarted + relaunched) | — |
+| 7 | bdc30ae | **All 4 trainers hang in `set_model_state_dict(broadcast_from_rank0=True)`** at `mesh_size=4`. iter 13 had only *disabled* the broadcast for the 1-rank mesh and left the multi-trainer path as a TODO. PyTorch's `_broadcast_state_dict` hard-codes `group=None`, so the broadcast lands on the 2N-rank union default PG; the N engine ranks never enter this path → deadlock. | `_default_pg_override` context manager: for `mesh_size≥2`, temporarily install the trainer-only FSDP mesh group as the process-wide default PG for the duration of `set_model_state_dict`, redirecting its internal `group=None` broadcast onto the trainer sub-world. |
+
+### End state — full `--full` suite green on 4×H100
+
+```
+test_phase4_tiny_one_step                  PASSED  (steps 1/1)
+test_phase7_tiny_loss_decreases            PASSED  (steps 20/20)
+test_phase4_one_step_completes_end_to_end  PASSED  (steps 1/1)
+test_phase7_grad_parity_smoke              PASSED  (steps 1/1)
+test_phase6_peak_alloc_flatness            PASSED  (steps 200/200)
+test_phase7_convergence_loss_decreases     PASSED  (steps 50/50, loss → 3.27)
+============== 6 passed, 2 warnings in 574.46s (0:09:34) ===============
+```
+
+The colocate path is now green with a *real* multi-rank trainer mesh:
+4-trainer FSDP (REPLICATE) state-dict load + gradient all-reduce, the
+4-engine sglang side, the gloo-staged hidden-state transfer on the
+8-rank union, and 200-step peak-alloc flatness all hold. Every bug in
+runs #1-#7 was the same shape — a collective that only deadlocks once
+the trainer mesh is ≥2 ranks, invisible to the dp_size=1 tiny smoke.
+
+### Op note
+
+A Vast instance left `stopped` bills storage only (cheap), but a
+`running` idle pod burns the full GPU rate — stop or destroy it as soon
+as the suite exits. Runs #5-#6 were lost to the pod stopping mid-run;
+the relaunch is cheap (disk + HF cache persist) but costs a fresh
+~10 min suite each time.
