@@ -1551,3 +1551,148 @@ this session, restartable in ~30 s with cache intact.
 - **CI cost.** The `--full` suite is ~10 min on 4×H100 (~$1.8/run).
   Decide whether it runs on-demand only or gated behind a label;
   the tiny smoke (1×GPU) stays the fast pre-merge check.
+
+---
+
+## Vast verification session #5 (2026-05-15) — independent re-confirm + audit + checkpoint scoping
+
+Follow-on after session #4. Goals: (1) **independently re-verify** the green
+4×H100 `--full` result against current branch HEAD; (2) **audit** the
+remaining `N==1` / `single_rank_mesh` special-cases the run #1-#7 bug pattern
+suggested might still be lurking; (3) **fix** the one site the audit
+surfaced before it becomes the next bug.
+
+### Independent verification re-run
+
+The session #4 pod (`36786680`, 4×H100 SXM) was left *stopped*. By the time
+this session ran, that host's GPUs had been re-rented by another customer —
+`PUT /instances/36786680/ {"state":"running"}` returned `resources_unavailable`,
+"state change queued". **Lesson:** Vast stopped instances are not
+reliably restartable; the disk persists but the host is volatile.
+
+Provisioned a fresh **4×H100 NVL** instance (`36794898`, $11.74/hr,
+reliability 1.00), fresh clone of `feature/colocate-training-inference` at
+HEAD `a85cec7` (all four N>1 fixes — `33b7e26`, `a5a0288`, `058871d`,
+`bdc30ae`), unmodified `run_smoke_host.sh --full`. Result:
+
+```
+test_phase4_tiny_one_step                  PASSED  (steps 1/1)
+test_phase7_tiny_loss_decreases            PASSED  (steps 20/20)
+test_phase4_one_step_completes_end_to_end  PASSED  (steps 1/1)
+test_phase7_grad_parity_smoke              PASSED  (steps 1/1)
+test_phase6_peak_alloc_flatness            PASSED  (steps 200/200)
+test_phase7_convergence_loss_decreases     PASSED  (steps 50/50)
+============== 6 passed, 2 warnings in 734.59s (0:12:14) ==============
+  Smoke run complete (pytest exit=0, wall=737s)
+  [bootstrap] RUNNER EXIT CODE: 0
+```
+
+The H100 NVL host is slightly slower than the session #4 SXM host
+(574 → 734 s), but the outcome is identical: **6 / 6 PASSED**. The green
+result is reproducible on a clean instance, not just the original pod.
+Verification instance destroyed immediately after (`DELETE
+/instances/36794898/`); pod `36786680` was reaped by Vast.
+
+### `single_rank_mesh` / `N==1` audit
+
+Every run #1-#7 bug was the same shape: a code path only the dp_size=1 tiny
+smoke exercised, with a latent ≥2-rank bug. With `--full` now running real
+≥2-rank paths, the question was: are there *more* guards of this shape in
+code the green suite doesn't reach?
+
+Grep across `torchspec/` + `patches/` + `scripts/colocate/`:
+
+| Pattern | Sites | Status |
+|---|---|---|
+| `single_rank_mesh` | `fsdp.py:183` | bdc30ae fix site — validated both branches |
+| `mesh_size == 1` | `fsdp.py:174,183` | (comment + same assignment) |
+| `world_size == 1` / `dp_size == 1` / `n_per_role == 1` | none | — |
+| `>=2` / `>1` multi-rank gates | `world.py:335` (`fsdp_ranks ≥ 2`), `trainer.py:177` (`world_size ≥ 2`), `fsdp.py:256` (`sp_size > 1`) | a5a0288 site / `_setup_device_mesh` site / USP path (rejected upstream — unreachable in colocate) |
+| `n_per_role` used as a rank | `world.py:118`, `colocate.patch:243,451` | all correct or covered by 33b7e26/058871d |
+| `dist.get_rank() == 0` in cold paths | `checkpoint.py:298,320`, `eagle3_trainer.py:426,529`, `fsdp.py:160`, `trainer.py:646` | most are rank-0-only file/log ops; one was the bug below |
+
+**One latent bug found and fixed:** [`torchspec/training/checkpoint.py`](../../torchspec/training/checkpoint.py)
+makes **7 `dcp.save` / `dcp.load` calls** with no `process_group=` argument.
+PyTorch's `dcp` defaults to the world default PG; in colocate that's the
+2N-rank union world and the N engine ranks never enter checkpoint code, so
+an unscoped `dcp.save/load` deadlocks every trainer waiting for engines
+that aren't there. *Identical shape to bdc30ae* (`set_model_state_dict`'s
+hardcoded `group=None`).
+
+Invisible to the green suite — none of the 5 test configs set
+`save_steps>0`, so the checkpoint cold path never fires in `--full`. A real
+colocate training run with periodic checkpointing at any dp_size would hit
+it.
+
+Fix (commit **`59400f1`**): pass `process_group=actor.dp_group` to all 3
+`dcp.save` + 4 `dcp.load` calls. In disagg, `actor.dp_group` *is* the
+trainer DP group — zero behavior change. In colocate, it's the trainer-only
+sub-world from `_setup_device_mesh` — exactly the right group for trainer
+state-dict ops.
+
+### What `--full` covers vs doesn't (after this session)
+
+**Validated by `--full`:**
+
+| Code path | Test |
+|---|---|
+| MPS daemon + Ray + 2N union world rendezvous | every test |
+| 1-trainer DP fallback (gloo, single-rank mesh) | tiny ×2 |
+| 4-trainer FSDP NCCL subgroup + multi-rank `set_model_state_dict` | full ×4 |
+| Engine→trainer gloo-staged hidden-state P2P (single pair) | tiny ×2 |
+| 4 concurrent engine↔trainer P2P pairs | full ×4 |
+| Eagle3 draft fwd/bwd, optimizer step, gradient flow | all 6 |
+| 200-step peak-allocation flatness | stability |
+| 50-step loss convergence | convergence |
+
+**Not covered by `--full`** (`run_smoke_host.sh --full` test set):
+
+- Checkpoint save / resume (`save_steps==0` in every config)
+- Eval loop (`eval_dataset_size==0`)
+- USP + colocate (gated off by an early validation error)
+- Engine `tp_size > 1` (every config uses `inference_num_gpus_per_engine=1`)
+- Multi-node colocate (every config uses `training_num_nodes=1`)
+- True per-parameter gradient parity vs the Mooncake/disagg baseline (the
+  parked `test_grad_parity_full`)
+
+### Follow-ups (next steps after this session)
+
+The basic colocate feature is functionally complete and the green `--full`
+suite is reproducible. Outstanding work, in priority order:
+
+1. **Land the PR** — `feature/colocate-training-inference` is ready for review.
+   Runs #1-#7 plus the verification re-run are the story.
+2. **CUDA IPC hidden-state plane** *(perf)*. The suite currently uses
+   gloo CPU-staged transfer (a 2×H→D copy per step). CUDA IPC
+   (zero-copy intra-device) is the natural optimization now that
+   correctness is locked in.
+3. **Multi-engine TP (`tp_size > 1`)**. `build_engine_tp_ranks` and
+   `engine_global_rank` are explicitly scoped to `engine_tp_size == 1`
+   (the colocate invariant) and will need to return a contiguous block
+   `[N + engine_index*tp, N + engine_index*tp + tp)` if multi-TP engines
+   are ever exercised.
+4. **Multi-node colocate**. Every test uses `training_num_nodes=1`. The
+   union-world rendezvous + the gloo P2P transport should scale across
+   nodes, but it's untested.
+5. **True grad-parity test vs Mooncake baseline**. `test_grad_parity_smoke`
+   only checks loss is finite and nonzero; the issue's validation plan
+   asks for per-parameter gradient match against the disagg baseline at
+   `<1e-6 abs`. `test_grad_parity_full` is parked in the same module —
+   landing it requires the deterministic-seed plumbing the parked test
+   needs.
+6. **Long-run stability (1000+ steps)**. `test_stability` runs 200 steps;
+   the issue's validation plan calls for 1000. Bump `PHASE6_STABILITY_STEPS`
+   and add to a nightly job.
+7. **CI cost decision**. `--full` is ~10 min / ~$2 per run on 4×H100.
+   Decide on-demand vs label-gated. Tiny smoke (1×GPU) remains the fast
+   pre-merge check.
+
+### Op note on Vast stopped instances
+
+The cost-saving plan ("stop the instance, restart later, disk + caches
+persist") only works *if* the host's GPUs aren't rented by someone else
+during the stop window. Tonight that gamble failed: pod `36786680`
+became permanently unrestartable after a few hours stopped (the host
+re-rented). **Recommendation:** for any pod whose disk holds work you
+need to come back to, either keep it running, or `scp` the artifacts off
+first and accept the disk loss.
