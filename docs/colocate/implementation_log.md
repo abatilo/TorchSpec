@@ -1485,10 +1485,69 @@ The colocate path is now green with a *real* multi-rank trainer mesh:
 runs #1-#7 was the same shape — a collective that only deadlocks once
 the trainer mesh is ≥2 ranks, invisible to the dp_size=1 tiny smoke.
 
+### Debugging the run #7 hang — methodology
+
+The run #7 deadlock left no traceback (a hung collective just blocks),
+so it was found by forensics rather than a stack trace:
+
+1. **Pod state.** The Vast instance was found `stopped`, not running —
+   runs #5/#6 had been interrupted by the pod stopping mid-run, not by
+   a code failure. Restarted via the Vast API (`PUT /instances/{id}/
+   {"state":"running"}`); disk + HF cache persist across stop/start, so
+   the relaunch (`/root/launch_quad.sh`) just re-clones and re-runs.
+2. **Frozen-log symptom.** After relaunch, `quad.log` and
+   `colocate-smoke-pytest.log` both froze for 12+ min at the
+   `test_one_step` nodeid line — yet all 4 GPUs showed ~40.9 GB
+   allocated at 0 % util / idle power. Models loaded, then everyone
+   went idle = a hang, not slow progress.
+3. **py-spy blocked.** `py-spy dump` failed with `Permission denied`
+   (the Vast container has no `SYS_PTRACE` cap), so no live stack trace
+   was available.
+4. **Ray per-worker logs.** The break: Ray writes full per-actor output
+   to `/tmp/ray/session_*/logs/worker-*.{out,err}` even when it isn't
+   forwarded to the driver's stdout. Tailing all 8 actor `.err` files
+   showed the 4 SglEngines fully initialised, and all 4 TrainerActors
+   stopped at the *identical* line: `fsdp.py` —
+   `BEFORE set_model_state_dict (mesh_size=4, broadcast_from_rank0=True)`,
+   never reaching `AFTER`. That pinned the hang to one call.
+5. **Confirmed the group.** Reading torch 2.9's
+   `_state_dict_utils._broadcast_state_dict` showed `pg` is a parameter
+   but `set_model_state_dict`'s caller never passes it → always
+   `group=None` → default PG → the 2N-rank union. Fix written, pushed,
+   relaunched → run #7 green.
+
+Takeaway for the next colocate hang: **go straight to the Ray
+per-worker `.err` files** — they survive even when the driver log is
+frozen, and a hung collective shows as N actors all parked on the
+same log line with the (N+1)th never printed.
+
 ### Op note
 
 A Vast instance left `stopped` bills storage only (cheap), but a
 `running` idle pod burns the full GPU rate — stop or destroy it as soon
 as the suite exits. Runs #5-#6 were lost to the pod stopping mid-run;
 the relaunch is cheap (disk + HF cache persist) but costs a fresh
-~10 min suite each time.
+~10 min suite each time. Instance `36786680` is left `stopped` after
+this session, restartable in ~30 s with cache intact.
+
+### Next steps
+
+- **Open the PR** from `feature/colocate-training-inference` — the
+  4×H100 `--full` suite is green; runs #1-#7 are the PR story.
+- **Audit the remaining `single_rank_mesh` / `N==1` special-cases.**
+  Every run #1-#7 bug was a path that only the dp_size=1 tiny smoke
+  exercised. `grep` for `single_rank_mesh`, `size() == 1`,
+  `world_size == 1`, `mesh_size == 1` in `torchspec/` and confirm each
+  has now had a real ≥2-rank run — the FSDP broadcast was the last
+  *known* TODO of this shape, but the pattern suggests there may be
+  more lurking.
+- **Larger trainer mesh / dp_size > 1 per engine.** This session was
+  4 trainers + 4 engines, 1:1 paired. Exercise dp_size > 1 and
+  tp_size > 1 on the engine side; the gloo hidden-state routing was
+  designed for it but hasn't been run.
+- **CUDA IPC hidden-state plane (perf).** The correctness suite uses
+  the gloo CPU-staged transfer. CUDA IPC (zero-copy intra-device) is
+  the eventual optimisation now that correctness is locked in.
+- **CI cost.** The `--full` suite is ~10 min on 4×H100 (~$1.8/run).
+  Decide whether it runs on-demand only or gated behind a label;
+  the tiny smoke (1×GPU) stays the fast pre-merge check.
