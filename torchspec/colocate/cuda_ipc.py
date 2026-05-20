@@ -134,9 +134,15 @@ def _reset_probe_cache_for_test() -> None:
 # Wire protocol
 # ---------------------------------------------------------------------------
 
-# tag for the trainer->engine ack (distinct direction from the object
-# list, so it never collides with send_object_list's internal sends).
-_ACK_TAG = 7001
+# Distinct tags for the three point-to-point messages of one transfer.
+# The payload is shipped as plain dist.send/recv of byte tensors — the
+# same primitive the gloo CPU-staged path uses (proven on the union
+# meta_group). The send_object_list / recv_object_list helpers were
+# observed to deadlock on this group, so we pickle + frame the blob
+# ourselves.
+_IPC_LEN_TAG = 7001
+_IPC_DATA_TAG = 7002
+_IPC_ACK_TAG = 7003
 
 
 def ipc_send(
@@ -150,6 +156,8 @@ def ipc_send(
     caller's tensors stay valid for the whole transfer — same contract
     as the blocking gloo ``dist.send`` this replaces.
     """
+    import pickle
+
     import torch
     import torch.distributed as dist
     from torch.multiprocessing.reductions import reduce_tensor
@@ -172,13 +180,18 @@ def ipc_send(
         _rebuild_fn, args = reduce_tensor(t)
         payloads.append((name, args))
 
-    cpu = torch.device("cpu")
-    dist.send_object_list([payloads], dst=dst, group=group, device=cpu)
+    # Pickle the IPC-handle payloads and ship as a length-framed byte
+    # tensor via plain dist.send (the gloo path's proven primitive).
+    blob = bytearray(pickle.dumps(payloads, protocol=pickle.HIGHEST_PROTOCOL))
+    buf = torch.frombuffer(blob, dtype=torch.uint8)
+    length = torch.tensor([buf.numel()], dtype=torch.long)
+    dist.send(length, dst=dst, group=group, tag=_IPC_LEN_TAG)
+    dist.send(buf, dst=dst, group=group, tag=_IPC_DATA_TAG)
 
     # Block until the trainer has cloned the data out of our memory.
     ack = torch.zeros(1, dtype=torch.uint8)
-    dist.recv(ack, src=dst, group=group, tag=_ACK_TAG)
-    del keepalive
+    dist.recv(ack, src=dst, group=group, tag=_IPC_ACK_TAG)
+    del keepalive, blob
 
 
 def ipc_recv(
@@ -194,14 +207,18 @@ def ipc_recv(
     validate the received key set — the shapes/dtypes ride along inside
     the IPC payload.
     """
+    import pickle
+
     import torch
     import torch.distributed as dist
     from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-    holder: list = [None]
-    dist.recv_object_list(holder, src=src, group=group,
-                          device=torch.device("cpu"))
-    payloads = holder[0]
+    # Receive the length-framed pickled payload (mirrors ipc_send).
+    length = torch.empty(1, dtype=torch.long)
+    dist.recv(length, src=src, group=group, tag=_IPC_LEN_TAG)
+    buf = torch.empty(int(length.item()), dtype=torch.uint8)
+    dist.recv(buf, src=src, group=group, tag=_IPC_DATA_TAG)
+    payloads = pickle.loads(buf.numpy().tobytes())
     if not isinstance(payloads, list):
         raise RuntimeError(
             f"cuda_ipc.ipc_recv: expected a list payload, got {type(payloads)}"
@@ -230,5 +247,5 @@ def ipc_recv(
         )
 
     ack = torch.ones(1, dtype=torch.uint8)
-    dist.send(ack, dst=src, group=group, tag=_ACK_TAG)
+    dist.send(ack, dst=src, group=group, tag=_IPC_ACK_TAG)
     return out
