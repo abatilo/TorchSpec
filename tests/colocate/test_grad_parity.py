@@ -89,10 +89,16 @@ def _run_arm(
     seed: int = 42,
     extra_args: list[str] | None = None,
     timeout_s: int = 1800,
+    disable_mps: bool = False,
 ) -> str:
     """Run train_entry for 1 step, dumping per-parameter gradients.
 
     Returns the captured combined stdout+stderr log.
+
+    ``disable_mps`` is for the disaggregated arm: it is a non-colocate
+    run and must not be caught by an MPS daemon left running by the
+    colocate arm / earlier tests (its actors otherwise fail MPS's
+    CUDA_VISIBLE_DEVICES validation and the worker dies).
     """
     config_path = REPO_ROOT / "configs" / config_name
     dataset = REPO_ROOT / "examples" / "data" / "sample_conversations.jsonl"
@@ -105,6 +111,10 @@ def _run_arm(
     # Engage the strict deterministic-kernel path in seed_everything on
     # both arms (see torchspec/colocate/determinism.py).
     env["TORCHSPEC_GRAD_PARITY"] = "1"
+    if disable_mps:
+        env.pop("CUDA_MPS_PIPE_DIRECTORY", None)
+        env.pop("CUDA_MPS_LOG_DIRECTORY", None)
+        env["TORCHSPEC_DISABLE_MPS"] = "1"
 
     cmd = [
         "python", "-m", "torchspec.train_entry",
@@ -326,9 +336,18 @@ def test_phase7_grad_parity_full():
     """
     tmp = Path(tempfile.mkdtemp(prefix="gradfull-"))
 
-    # Disagg baseline arm: 2 GPUs (trainer + engine disjoint).
+    # The disagg arm is a non-colocate run. If an MPS daemon is up on
+    # this node (the determinism test / colocate arm starts one), the
+    # disagg actors get caught by MPS and die on its CUDA_VISIBLE_DEVICES
+    # validation. Stop the daemon first; the colocate arm's train_entry
+    # restarts it via setup_for_colocate.
+    from torchspec.colocate.mps import stop_mps_daemon
+
+    stop_mps_daemon()
+
+    # Disagg baseline arm: 2 GPUs (trainer + engine disjoint), MPS off.
     _run_arm("disagg_qwen0p6b_tiny.yaml", dump_dir=tmp / "disagg",
-             visible_devices="0,1", seed=42)
+             visible_devices="0,1", seed=42, disable_mps=True)
     # Colocate arm: 1 GPU (trainer + engine MPS-shared).
     _run_arm("colocate_qwen0p6b_tiny.yaml", dump_dir=tmp / "colocate",
              visible_devices="0", seed=42)
