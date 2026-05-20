@@ -126,6 +126,12 @@ if [[ $RUN_STABILITY -eq 1 ]]; then
   export PHASE6_STABILITY_STEPS="${PHASE6_STABILITY_STEPS:-1000}"
 fi
 
+# This runner installs into the pod's system Python. On PEP-668
+# distros (Ubuntu 24.04 image, pip >= 23.3) that is "externally
+# managed" and pip refuses without this flag. The host is a throwaway
+# rental, so installing system-wide is fine.
+export PIP_BREAK_SYSTEM_PACKAGES="${PIP_BREAK_SYSTEM_PACKAGES:-1}"
+
 banner() {
   echo
   echo "=============================================="
@@ -245,6 +251,11 @@ setup_sglang() {
     git fetch --depth=1 origin "$SGLANG_COMMIT" || true
     git checkout "$SGLANG_COMMIT"
     git reset --hard HEAD
+    # git reset --hard only restores *tracked* files; colocate.patch
+    # creates new files (e.g. torchspec_colocate.py) that survive a
+    # reset, so a second run would fail "already exists in working
+    # directory". git clean -fd drops them, making this idempotent.
+    git clean -fdq
     rm -f python/sglang/srt/speculative/spec_training_info.py
     git apply --recount "$PATCHES_DIR/sglang.patch" || true
     git apply --recount "$PATCHES_DIR/colocate.patch"
