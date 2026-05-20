@@ -257,6 +257,43 @@ def stop_mps_daemon(handle: Optional[MpsHandle] = None) -> bool:
         return False
 
 
+def force_stop_mps(
+    pipe_dir: str = DEFAULT_PIPE_DIR,
+    log_dir: str = DEFAULT_LOG_DIR,
+) -> None:
+    """Forcefully tear MPS down: kill the daemon + server, remove the dirs.
+
+    :func:`stop_mps_daemon` sends a graceful ``quit``, which a CUDA
+    client still attached to the MPS server can block indefinitely
+    ("Server was unable to shutdown due to N active clients"), leaving
+    the daemon stuck half-shutdown and rejecting new clients with CUDA
+    error 805. This always succeeds: SIGKILL the ``nvidia-cuda-mps``
+    processes and delete the pipe/log dirs so the node is cleanly
+    no-MPS again.
+
+    Use it to guarantee a no-MPS environment — e.g. a disaggregated run
+    on a node where a colocate run left MPS up — or to recover from a
+    stuck daemon. A subsequent :func:`setup_for_colocate` starts fresh.
+    """
+    import time
+
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", "nvidia-cuda-mps"],
+            check=False, timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:  # pragma: no cover
+        logger.warning("force_stop_mps: pkill failed: %s", e)
+    time.sleep(1.0)
+    shutil.rmtree(pipe_dir, ignore_errors=True)
+    shutil.rmtree(log_dir, ignore_errors=True)
+    logger.info(
+        "force_stop_mps: killed nvidia-cuda-mps processes, removed %s + %s",
+        pipe_dir, log_dir,
+    )
+
+
 def _probe_mps_server_works(
     pipe_dir: str, log_dir: str, *, timeout_s: float = 30.0
 ) -> tuple[bool, str]:

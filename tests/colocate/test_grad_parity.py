@@ -337,13 +337,15 @@ def test_phase7_grad_parity_full():
     tmp = Path(tempfile.mkdtemp(prefix="gradfull-"))
 
     # The disagg arm is a non-colocate run. If an MPS daemon is up on
-    # this node (the determinism test / colocate arm starts one), the
-    # disagg actors get caught by MPS and die on its CUDA_VISIBLE_DEVICES
-    # validation. Stop the daemon first; the colocate arm's train_entry
-    # restarts it via setup_for_colocate.
-    from torchspec.colocate.mps import stop_mps_daemon
+    # this node (run_smoke_host.sh's pre-flight probe and the colocate
+    # determinism test both start one), every CUDA process on the node
+    # is routed through MPS and the disagg actors die (CUDA error 805 /
+    # invalid CUDA_VISIBLE_DEVICES). A graceful stop can be blocked
+    # forever by a still-attached client, so force the teardown; the
+    # colocate arm's train_entry restarts MPS via setup_for_colocate.
+    from torchspec.colocate.mps import force_stop_mps
 
-    stop_mps_daemon()
+    force_stop_mps()
 
     # Disagg baseline arm: 2 GPUs (trainer + engine disjoint), MPS off.
     _run_arm("disagg_qwen0p6b_tiny.yaml", dump_dir=tmp / "disagg",
