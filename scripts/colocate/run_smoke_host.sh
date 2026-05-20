@@ -298,6 +298,7 @@ pick_test_files() {
       "tests/colocate/test_colocate_tiny.py"
       "tests/colocate/test_one_step.py"
       "tests/colocate/test_grad_parity.py"
+      "tests/colocate/test_colocate_checkpoint.py"
       "tests/colocate/test_stability.py"
       "tests/colocate/test_convergence.py"
     )

@@ -210,6 +210,15 @@ def run_colocate_training_loop(
         ray.get(train_group._actor_handlers[0].get_global_step.remote())
     )
     num_steps = int(args.num_train_steps)
+    # Periodic checkpointing. The colocate loop uses the same
+    # `save_interval` config knob as the disagg loop (loop.py) -- the
+    # previous code read a non-existent `save_steps` attr via getattr,
+    # so the save path (and the dcp.save process_group= fix in
+    # checkpoint.py) was unreachable dead code. save_interval<=0
+    # disables saving. last_saved_step starts at the resume step so a
+    # resumed run doesn't immediately re-save.
+    save_interval = int(getattr(args, "save_interval", 0) or 0)
+    last_saved_step = completed_steps
     progress = tqdm(
         total=num_steps, desc="Colocate Training", unit="step",
         initial=completed_steps,
@@ -325,12 +334,29 @@ def run_colocate_training_loop(
                         metrics.get("perf/peak_bytes_allocated"),
                     )
 
+        if save_interval > 0 and completed_steps % save_interval == 0:
+            logger.info(
+                "[colocate_loop] Saving checkpoint at step %d ...",
+                completed_steps,
+            )
+            train_group.save_model(completed_steps, force_sync=True)
+            last_saved_step = completed_steps
+
     progress.close()
 
-    # Final save.
-    save_steps = int(getattr(args, "save_steps", 0) or 0)
-    if save_steps > 0 and completed_steps > 0:
+    # Final save: persist the last step if periodic saving is enabled
+    # and the last step wasn't already a save-interval boundary.
+    if (
+        save_interval > 0
+        and completed_steps > 0
+        and completed_steps != last_saved_step
+    ):
+        logger.info(
+            "[colocate_loop] Saving final checkpoint at step %d ...",
+            completed_steps,
+        )
         train_group.save_model(completed_steps, force_sync=True)
+        last_saved_step = completed_steps
 
     logger.info(
         "[colocate_loop] Training complete: completed_steps=%d / num_steps=%d",
