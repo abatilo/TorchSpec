@@ -181,6 +181,7 @@ index 000000000..aba6359c1
 +
 +_TRANSFER_MODE_ENV = "TORCHSPEC_COLOCATE_TRANSFER_MODE"
 +_PAIRED_TRAINER_RANK_ENV = "TORCHSPEC_COLOCATE_PAIRED_TRAINER_RANK"
++_ENGINE_TP_SIZE_ENV = "TORCHSPEC_COLOCATE_ENGINE_TP_SIZE"
 +_UNION_MASTER_ADDR_ENV = "TORCHSPEC_COLOCATE_UNION_MASTER_ADDR"
 +_UNION_MASTER_PORT_ENV = "TORCHSPEC_COLOCATE_UNION_MASTER_PORT"
 +_UNION_WORLD_SIZE_ENV = "TORCHSPEC_COLOCATE_UNION_WORLD_SIZE"
@@ -217,30 +218,39 @@ index 000000000..aba6359c1
 +    world_size: int
 +    n_per_role: int
 +    timeout_minutes: int
++    engine_tp_size: int = 1
 +
 +    @property
 +    def init_method(self) -> str:
 +        return f"tcp://{self.master_addr}:{self.master_port}"
 +
 +    def engine_global_rank(self, tp_rank: int = 0) -> int:
-+        """Return this engine subprocess' union-world rank.
++        """Return the union-world rank of this engine's TP rank ``tp_rank``.
 +
-+        Engines occupy ``[N, 2N)`` in the union world. Under the
-+        colocate invariant (``engine_count * engine_tp_size ==
-+        training_world_size`` with ``engine_tp_size == 1``) each engine
-+        is paired 1:1 with a trainer, so the engine *index* is exactly
-+        ``paired_trainer_rank`` and the union rank is
-+        ``N + paired_trainer_rank``. ``tp_rank`` is the TP rank *within*
-+        this engine's own size-1 TP group (always 0) and is NOT the
-+        union-world offset — passing it as the offset made every engine
-+        claim rank N (fine at N=1, a hard rendezvous deadlock at N>1).
++        Engines occupy ``[N, 2N)`` in the union world. With
++        ``engine_count * engine_tp_size == training_world_size``,
++        engine ``e``'s TP group owns the contiguous trainer-rank block
++        ``[e*tp, e*tp+tp)``; ``paired_trainer_rank`` is that block's
++        BASE (``e*engine_tp_size``). TP rank ``t`` pairs 1:1 with
++        trainer rank ``paired_trainer_rank + t`` and so sits at union
++        rank ``N + paired_trainer_rank + t``.
++
++        At ``engine_tp_size == 1`` the base equals the engine index and
++        ``tp_rank`` is always 0, so this is ``N + paired_trainer_rank``
++        — byte-identical to the pre-multi-TP behaviour.
 +        """
-+        if not 0 <= self.paired_trainer_rank < self.n_per_role:
++        if not 0 <= tp_rank < self.engine_tp_size:
 +            raise ValueError(
-+                f"paired_trainer_rank={self.paired_trainer_rank} out of "
-+                f"range [0, {self.n_per_role})"
++                f"tp_rank={tp_rank} out of range [0, {self.engine_tp_size})"
 +            )
-+        return self.n_per_role + self.paired_trainer_rank
++        base = self.paired_trainer_rank + tp_rank
++        if not 0 <= base < self.n_per_role:
++            raise ValueError(
++                f"engine global-rank base {base} out of range "
++                f"[0, {self.n_per_role}) (paired_trainer_rank="
++                f"{self.paired_trainer_rank}, tp_rank={tp_rank})"
++            )
++        return self.n_per_role + base
 +
 +
 +def is_colocate_active() -> bool:
@@ -272,6 +282,7 @@ index 000000000..aba6359c1
 +            world_size=int(os.environ[_UNION_WORLD_SIZE_ENV]),
 +            n_per_role=int(os.environ[_UNION_N_PER_ROLE_ENV]),
 +            timeout_minutes=int(os.environ.get(_UNION_TIMEOUT_MIN_ENV, "30")),
++            engine_tp_size=int(os.environ.get(_ENGINE_TP_SIZE_ENV, "1")),
 +        )
 +    except KeyError as e:
 +        raise RuntimeError(
@@ -433,22 +444,22 @@ index 000000000..aba6359c1
 +
 +
 +def build_engine_tp_ranks(env: ColocateEnv) -> list[int]:
-+    """Return the union-world ranks forming THIS engine's TP group.
++    """Return the contiguous union-world rank block of THIS engine's TP group.
 +
-+    Under the colocate-config invariant ``engine_count *
-+    engine_tp_size == training_world_size`` with ``engine_tp_size ==
-+    1``, each engine is its own singleton TP group: union rank
-+    ``[N + paired_trainer_rank]``. Used both for
-+    ``initialize_model_parallel(..., tp_world_ranks=...)`` (whose
-+    length must equal ``tensor_model_parallel_size``) and for
-+    ``rebuild_world_group_engine_only`` (this engine's own ``_WORLD``).
++    With ``engine_count * engine_tp_size == training_world_size``,
++    engine ``e`` owns union ranks ``[N + e*tp, N + e*tp + tp)`` where
++    ``tp = engine_tp_size`` and ``e*tp == paired_trainer_rank`` (the
++    block base). The returned list has length ``engine_tp_size`` —
++    exactly what ``initialize_model_parallel(..., tp_world_ranks=...)``
++    requires (its length must equal ``tensor_model_parallel_size``) and
++    what ``rebuild_world_group_engine_only`` needs for this engine's
++    own ``_WORLD``.
 +
-+    The old ``range(N, 2N)`` form returned every engine rank — a
-+    length-1 singleton at N=1 (so it worked) but a length-N list at
-+    N>1, which mismatched ``tp_size=1`` and cross-wired the engines'
-+    ``_WORLD`` groups.
++    At ``engine_tp_size == 1`` this is the single-element list
++    ``[N + paired_trainer_rank]`` it always was.
 +    """
-+    return [env.n_per_role + env.paired_trainer_rank]
++    base = env.n_per_role + env.paired_trainer_rank
++    return [base + t for t in range(env.engine_tp_size)]
 +
 +
 +def rebuild_world_group_engine_only(env, local_rank, backend="nccl"):

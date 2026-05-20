@@ -470,6 +470,13 @@ def train_async_no_generation(args):
                 "TORCHSPEC_COLOCATE_UNION_WORLD_SIZE": str(2 * n_per_role),
                 "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE": str(n_per_role),
                 "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN": str(union_timeout_min),
+                # engine_tp_size for the colocate rank math. Currently
+                # always 1 (validator invariant D); part of the contract
+                # so the multi-TP data-plane work doesn't have to touch
+                # the env wiring later.
+                "TORCHSPEC_COLOCATE_ENGINE_TP_SIZE": str(
+                    int(getattr(args, "inference_num_gpus_per_engine", 1) or 1)
+                ),
             }
             # Re-publish the operator's CUDA IPC opt-in through the same
             # env contract so the trainer-side fetcher and the engine-side
