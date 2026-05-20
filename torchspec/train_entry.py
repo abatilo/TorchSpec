@@ -471,6 +471,13 @@ def train_async_no_generation(args):
                 "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE": str(n_per_role),
                 "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN": str(union_timeout_min),
             }
+            # Re-publish the operator's CUDA IPC opt-in through the same
+            # env contract so the trainer-side fetcher and the engine-side
+            # connector make an identical transport decision (a one-sided
+            # choice would desync the wire protocol).
+            _ipc_opt = os.environ.get("TORCHSPEC_COLOCATE_IPC")
+            if _ipc_opt is not None:
+                union_env["TORCHSPEC_COLOCATE_IPC"] = _ipc_opt
             for k, v in union_env.items():
                 os.environ[k] = v
             engine_extra_env = union_env

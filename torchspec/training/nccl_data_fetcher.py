@@ -47,6 +47,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from torchspec.colocate.cuda_ipc import ensure_ipc_usable, ipc_recv, ipc_requested
+
 logger = logging.getLogger("torchspec.training.nccl_data_fetcher")
 
 
@@ -277,6 +279,11 @@ class NcclMultiTensorFetcher:
         self._src = int(src_global_rank)
         self._device = device
         self._group = group
+        # Opt-in CUDA IPC transport (must match the engine connector).
+        # Fail fast at construction if requested but unusable.
+        self._use_ipc = ipc_requested() and _group_is_gloo(self._group)
+        if self._use_ipc:
+            ensure_ipc_usable()
 
     @property
     def src_global_rank(self) -> int:
@@ -302,6 +309,16 @@ class NcclMultiTensorFetcher:
             raise ValueError("recv_step requires at least one tensor spec")
 
         names = _sorted_tensor_names(tensor_specs)
+
+        if self._use_ipc:
+            # Zero-copy: map the engine's GPU memory via CUDA IPC and
+            # copy on-device into trainer-owned buffers. No host
+            # round-trip.
+            logger.debug(
+                "NcclMultiTensorFetcher.recv_step (cuda-ipc): src=%d names=%s",
+                self._src, names,
+            )
+            return ipc_recv(tensor_specs, self._src, self._device, self._group)
 
         if _group_is_gloo(self._group):
             # Colocate transport: receive into host buffers over the

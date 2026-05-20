@@ -1,0 +1,234 @@
+# Copyright (c) 2026 LightSeek Foundation
+# MIT License
+
+"""CUDA IPC zero-copy hidden-state transport for colocate mode.
+
+The default colocate hidden-state plane stages through host memory: the
+engine does a D->H copy, ships the bytes over the gloo ``meta_group``,
+and the trainer does an H->D copy. Two PCIe-class copies per tensor per
+step. Both processes share the *same physical GPU* under MPS, so the
+host round-trip is pure overhead — the data never needs to leave the
+device.
+
+This module is the zero-copy alternative. The engine exports a CUDA IPC
+handle for each hidden-state tensor (via PyTorch's
+``torch.multiprocessing`` reduction machinery), ships the small handle
+blobs over the gloo channel, and the trainer maps the engine's GPU
+memory directly and does a single on-device D->D copy into its own
+buffer. No host round-trip.
+
+Opt-in
+------
+This path is **opt-in** via ``TORCHSPEC_COLOCATE_IPC=1`` and layered on
+top of ``transfer_mode=nccl`` (it replaces only the gloo transport, not
+the union-world bootstrap). Both the engine connector and the trainer
+fetcher read the *same* env var, so the two sides always agree on the
+transport without a runtime negotiation message.
+
+The ``expandable_segments`` conflict
+------------------------------------
+``cudaIpcGetMemHandle`` requires a plain ``cudaMalloc`` allocation; it
+fails on the virtual-memory segments produced by
+``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` — which the colocate
+path sets everywhere. :func:`probe_ipc_capability` detects this (and any
+other platform reason IPC can't work) by attempting a real
+``reduce_tensor`` on a scratch CUDA tensor. The connector/fetcher call
+it once at construction and **fail fast** with an actionable message if
+IPC was requested but is unavailable, rather than silently falling back
+(a one-sided fallback would desync the wire protocol).
+
+Wire protocol
+-------------
+Per step, engine -> trainer over the gloo group:
+
+  1. engine: ``send_object_list([[(name, ipc_args), ...]])`` — the
+     pickled IPC handle blobs, in ``sorted(name)`` order.
+  2. trainer: ``recv_object_list`` -> rebuild each tensor as an alias of
+     the engine's memory -> ``.clone()`` into a trainer-owned buffer ->
+     ``cuda.synchronize()``.
+  3. trainer: send a 1-byte ack back.
+  4. engine: block on the ack before returning from ``send`` — this
+     keeps the engine's (sglang-owned) hidden-state tensors alive until
+     the trainer has finished copying, exactly like the blocking gloo
+     ``send`` it replaces.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Dict, Optional, Tuple
+
+_IPC_ENV = "TORCHSPEC_COLOCATE_IPC"
+
+# Cached (ok, reason) from the one-time capability probe.
+_probe_cache: Optional[Tuple[bool, str]] = None
+
+
+def ipc_requested() -> bool:
+    """True iff the operator opted into the CUDA IPC transport."""
+    return os.environ.get(_IPC_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def probe_ipc_capability() -> Tuple[bool, str]:
+    """Probe whether CUDA IPC can actually be used on this process.
+
+    Returns ``(ok, reason)``. Cached after the first call. ``ok`` is
+    False when CUDA is absent, or when ``reduce_tensor`` raises — most
+    commonly because ``expandable_segments`` is active (its cuMemMap
+    segments are not IPC-shareable).
+    """
+    global _probe_cache
+    if _probe_cache is not None:
+        return _probe_cache
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            _probe_cache = (False, "CUDA not available")
+            return _probe_cache
+
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        scratch = torch.empty(8, dtype=torch.float32, device="cuda")
+        # reduce_tensor -> (rebuild_fn, args); this is the call that
+        # invokes the storage's _share_cuda_ and raises on expandable
+        # segments / unsupported platforms.
+        reduce_tensor(scratch)
+        del scratch
+        _probe_cache = (True, "ok")
+    except Exception as e:  # pragma: no cover - needs a real GPU
+        hint = ""
+        if "expandable" in repr(e).lower() or "cuMemMap" in repr(e):
+            hint = (
+                " — likely PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; "
+                "CUDA IPC needs plain cudaMalloc memory. Drop expandable_"
+                "segments for the colocate run, or leave TORCHSPEC_COLOCATE_IPC"
+                " unset to use the gloo transport."
+            )
+        _probe_cache = (False, f"{e!r}{hint}")
+    return _probe_cache
+
+
+def ensure_ipc_usable() -> None:
+    """Raise a clear error if IPC was requested but is not usable.
+
+    Called once at connector/fetcher construction. Both sides run the
+    same check on the same platform, so they fail (or pass) together.
+    """
+    ok, reason = probe_ipc_capability()
+    if not ok:
+        raise RuntimeError(
+            f"TORCHSPEC_COLOCATE_IPC is set but CUDA IPC is not usable on "
+            f"this host: {reason}"
+        )
+
+
+def _reset_probe_cache_for_test() -> None:
+    """Test hook: clear the cached probe result."""
+    global _probe_cache
+    _probe_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Wire protocol
+# ---------------------------------------------------------------------------
+
+# tag for the trainer->engine ack (distinct direction from the object
+# list, so it never collides with send_object_list's internal sends).
+_ACK_TAG = 7001
+
+
+def ipc_send(
+    tensors: Dict[str, "torch.Tensor"],  # noqa: F821
+    dst: int,
+    group,
+) -> None:
+    """Engine side: ship hidden-state tensors to ``dst`` via CUDA IPC.
+
+    Blocks until the trainer acks (i.e. has cloned the data), so the
+    caller's tensors stay valid for the whole transfer — same contract
+    as the blocking gloo ``dist.send`` this replaces.
+    """
+    import torch
+    import torch.distributed as dist
+    from torch.multiprocessing.reductions import reduce_tensor
+
+    names = sorted(tensors.keys())
+    keepalive = []  # hold contiguous copies alive until the ack
+    payloads = []
+    for name in names:
+        t = tensors[name].detach()
+        if t.device.type != "cuda":
+            raise ValueError(
+                f"cuda_ipc.ipc_send requires CUDA tensors; '{name}' is on "
+                f"{t.device}"
+            )
+        if not t.is_contiguous():
+            t = t.contiguous()
+        keepalive.append(t)
+        # reduce_tensor returns (rebuild_cuda_tensor, args); only the
+        # args tuple needs to travel — the receiver knows the rebuild fn.
+        _rebuild_fn, args = reduce_tensor(t)
+        payloads.append((name, args))
+
+    cpu = torch.device("cpu")
+    dist.send_object_list([payloads], dst=dst, group=group, device=cpu)
+
+    # Block until the trainer has cloned the data out of our memory.
+    ack = torch.zeros(1, dtype=torch.uint8)
+    dist.recv(ack, src=dst, group=group, tag=_ACK_TAG)
+    del keepalive
+
+
+def ipc_recv(
+    tensor_specs: Dict[str, Tuple],
+    src: int,
+    device: "torch.device",  # noqa: F821
+    group,
+) -> Dict[str, "torch.Tensor"]:  # noqa: F821
+    """Trainer side: receive hidden-state tensors from ``src`` via CUDA IPC.
+
+    Maps the engine's GPU memory, copies (D->D, on-device) into
+    trainer-owned buffers, then acks. ``tensor_specs`` is used only to
+    validate the received key set — the shapes/dtypes ride along inside
+    the IPC payload.
+    """
+    import torch
+    import torch.distributed as dist
+    from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+    holder: list = [None]
+    dist.recv_object_list(holder, src=src, group=group,
+                          device=torch.device("cpu"))
+    payloads = holder[0]
+    if not isinstance(payloads, list):
+        raise RuntimeError(
+            f"cuda_ipc.ipc_recv: expected a list payload, got {type(payloads)}"
+        )
+
+    out: Dict[str, torch.Tensor] = {}
+    aliases = []  # keep IPC aliases alive until the post-clone sync
+    for name, args in payloads:
+        alias = rebuild_cuda_tensor(*args)
+        aliases.append(alias)
+        # D->D copy into trainer-owned (normal) memory on `device`.
+        out[name] = alias.to(device, copy=True)
+
+    # The clones above are async on the current stream; finish them
+    # before we drop the aliases and ack (after which the engine may
+    # free its memory).
+    torch.cuda.synchronize()
+    del aliases
+
+    expected = set(tensor_specs.keys())
+    got = set(out.keys())
+    if expected != got:
+        raise RuntimeError(
+            f"cuda_ipc.ipc_recv: key mismatch — expected {sorted(expected)}, "
+            f"got {sorted(got)}"
+        )
+
+    ack = torch.ones(1, dtype=torch.uint8)
+    dist.send(ack, dst=src, group=group, tag=_ACK_TAG)
+    return out

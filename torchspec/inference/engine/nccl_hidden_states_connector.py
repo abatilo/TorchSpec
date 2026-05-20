@@ -64,6 +64,8 @@ from typing import Dict, Optional
 import torch
 import torch.distributed as dist
 
+from torchspec.colocate.cuda_ipc import ensure_ipc_usable, ipc_requested, ipc_send
+
 logger = logging.getLogger("torchspec.inference.engine.nccl_hidden_states_connector")
 
 # Env marker the engine sets when colocate NCCL transfer is selected. The
@@ -141,6 +143,13 @@ class NcclHiddenStatesConnector:
             )
         self._dst = int(dst_global_rank)
         self._group = group
+        # Opt-in CUDA IPC transport replaces the gloo CPU-staged path.
+        # Fail fast at construction if it was requested but the platform
+        # can't do it (e.g. expandable_segments active) so the engine and
+        # trainer never disagree on the wire format.
+        self._use_ipc = ipc_requested() and _group_is_gloo(self._group)
+        if self._use_ipc:
+            ensure_ipc_usable()
 
     @property
     def dst_global_rank(self) -> int:
@@ -175,6 +184,17 @@ class NcclHiddenStatesConnector:
             )
 
         names = sorted_tensor_names(tensors)
+
+        if self._use_ipc:
+            # Zero-copy: ship CUDA IPC handles over gloo, trainer maps
+            # our memory and does an on-device D->D copy. No host
+            # round-trip. Blocks until the trainer acks.
+            logger.debug(
+                "NcclHiddenStatesConnector.send (cuda-ipc): dst=%d names=%s",
+                self._dst, names,
+            )
+            ipc_send(tensors, self._dst, self._group)
+            return
 
         if _group_is_gloo(self._group):
             # Colocate transport: trainer + engine share one physical
