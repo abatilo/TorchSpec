@@ -382,3 +382,82 @@ def setup_for_colocate(
 
         atexit.register(stop_mps_daemon, handle)
     return handle, mps_client_env(pipe_dir=pipe_dir, log_dir=log_dir)
+
+
+def ensure_mps_on_all_nodes(
+    pipe_dir: str = DEFAULT_PIPE_DIR,
+    log_dir: str = DEFAULT_LOG_DIR,
+) -> dict[str, bool]:
+    """Start the MPS control daemon on every node of the Ray cluster.
+
+    The driver-side :func:`setup_for_colocate` only brings MPS up on the
+    *driver's own* node. For multi-node colocate, every node that will
+    host a trainer or engine actor needs its own daemon — once a node's
+    daemon is up, every CUDA process there must register with it (else
+    CUDA error 805). This schedules one idempotent bootstrap task per
+    live node via Ray node-affinity scheduling.
+
+    Must be called after ``ray.init()`` and before any colocate actor is
+    created. Idempotent — a node whose daemon is already running (e.g.
+    the driver node) is a no-op. Single-node clusters therefore make
+    this a no-op superset of the pre-Ray bring-up.
+
+    The per-node tasks pass ``probe_server=False`` (the driver node was
+    already probed pre-Ray; non-driver nodes are assumed validated by
+    the operator) and ``register_atexit=False`` (a short-lived Ray task
+    is not the daemon's owner — the daemon persists like the driver
+    node's, and is reaped by node teardown).
+
+    Returns ``{node_id: started_ok}``. Failures are logged, not raised:
+    a node that fails here will surface a clear CUDA error 805 when its
+    first actor starts.
+
+    NOTE: the multi-node colocate path is implemented but has only been
+    exercised single-node — see docs/colocate/usage.md.
+    """
+    import ray
+
+    try:
+        from ray.util.scheduling_strategies import (
+            NodeAffinitySchedulingStrategy,
+        )
+    except Exception:  # pragma: no cover - very old ray
+        logger.warning(
+            "ray.util.scheduling_strategies unavailable; cannot pin "
+            "per-node MPS bootstrap. Multi-node colocate needs MPS started "
+            "on each node out-of-band."
+        )
+        return {}
+
+    nodes = [n for n in ray.nodes() if n.get("Alive")]
+
+    @ray.remote(num_cpus=0)
+    def _bootstrap_mps_on_node() -> bool:
+        handle, _env = setup_for_colocate(
+            pipe_dir=pipe_dir,
+            log_dir=log_dir,
+            register_atexit=False,
+            probe_server=False,
+        )
+        return handle is not None
+
+    pending = {}
+    for n in nodes:
+        node_id = n["NodeID"]
+        strategy = NodeAffinitySchedulingStrategy(node_id, soft=False)
+        pending[node_id] = _bootstrap_mps_on_node.options(
+            scheduling_strategy=strategy
+        ).remote()
+
+    results: dict[str, bool] = {}
+    for node_id, ref in pending.items():
+        try:
+            results[node_id] = bool(ray.get(ref))
+        except Exception:
+            logger.exception("MPS bootstrap failed on node %s", node_id)
+            results[node_id] = False
+    logger.info(
+        "[colocate] per-node MPS bootstrap: %d/%d nodes ready",
+        sum(results.values()), len(results),
+    )
+    return results

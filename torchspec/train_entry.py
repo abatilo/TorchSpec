@@ -399,6 +399,20 @@ def train_async_no_generation(args):
         # `setup_for_colocate` is idempotent so callers expecting a
         # handle here still get one, but we intentionally don't
         # re-start the daemon.
+        #
+        # Multi-node colocate: step [0]'s pre-Ray MPS bring-up only
+        # covered the driver's own node. Bootstrap the daemon on every
+        # other node before the trainer/engine actors are placed there.
+        # No-op for single-node (the driver node's daemon is already up)
+        # so the validated single-node path is untouched.
+        if (
+            is_mps_colocate(args)
+            and not getattr(args, "colocate_mps_unavailable", False)
+            and int(getattr(args, "training_num_nodes", 1) or 1) > 1
+        ):
+            from torchspec.colocate.mps import ensure_mps_on_all_nodes
+
+            ensure_mps_on_all_nodes()
         pgs = create_placement_groups(args)
         # Phase 5: in colocate (NCCL transfer) mode the entire Mooncake
         # plumbing is unused. Skip both the master daemon and the
