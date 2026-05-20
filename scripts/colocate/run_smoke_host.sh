@@ -33,6 +33,7 @@
 #   bash scripts/colocate/run_smoke_host.sh --skip-setup    # tests only
 #   bash scripts/colocate/run_smoke_host.sh --setup-only    # bootstrap, no tests
 #   bash scripts/colocate/run_smoke_host.sh --full          # tiny + 4xGPU Phase 4/6/7
+#   bash scripts/colocate/run_smoke_host.sh --stability     # nightly 1000-step run (4xH100)
 #   bash scripts/colocate/run_smoke_host.sh --tests=A,B,C   # run specific test files
 #
 # Environment overrides:
@@ -97,6 +98,7 @@ REPORT_PATH="$REPO_ROOT/colocate-smoke-report.txt"
 DO_SETUP=1
 DO_RUN=1
 RUN_FULL=0
+RUN_STABILITY=0
 TESTS_OVERRIDE=""
 
 for arg in "$@"; do
@@ -104,6 +106,7 @@ for arg in "$@"; do
     --skip-setup) DO_SETUP=0 ;;
     --setup-only) DO_RUN=0 ;;
     --full) RUN_FULL=1 ;;
+    --stability) RUN_STABILITY=1 ;;
     --tests=*) TESTS_OVERRIDE="${arg#--tests=}" ;;
     --help|-h)
       grep -E '^# ' "$0" | sed 's/^# \?//'
@@ -115,6 +118,13 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# --stability: the nightly long-run job. Pin the step count to the
+# plan's 1000 (unless the caller already set it) so the test's 1 %
+# acceptance bar engages.
+if [[ $RUN_STABILITY -eq 1 ]]; then
+  export PHASE6_STABILITY_STEPS="${PHASE6_STABILITY_STEPS:-1000}"
+fi
 
 banner() {
   echo
@@ -272,6 +282,13 @@ setup_python() {
 pick_test_files() {
   if [[ -n "$TESTS_OVERRIDE" ]]; then
     IFS=',' read -ra TEST_FILES <<< "$TESTS_OVERRIDE"
+  elif [[ $RUN_STABILITY -eq 1 ]]; then
+    # Nightly long-run: just the stability test (PHASE6_STABILITY_STEPS
+    # already pinned to 1000 above). Hard-requires a 4×H100 + MPS host;
+    # self-skips cleanly elsewhere.
+    TEST_FILES=(
+      "tests/colocate/test_stability.py"
+    )
   elif [[ $RUN_FULL -eq 1 ]]; then
     # 4×H100-class hosts: run the tiny + every MPS-gated full test. Each
     # test self-skips if its preconditions aren't met (e.g. has_h100_quad

@@ -21,9 +21,12 @@ either:
   ``train_frac`` claim (Phase 1 invariant breach).
 
 To keep CI cost reasonable, this test is gated behind ``-m slow`` and
-the step count is capped to 200 by default; pass
-``PHASE6_STABILITY_STEPS=1000`` (the plan's reference number) when
-running on a dedicated 4×H100 sandbox.
+the step count defaults to 200; pass ``PHASE6_STABILITY_STEPS=1000``
+(the plan's reference number) for the full run. The nightly
+``.github/workflows/colocate-stability.yml`` job does exactly that on
+a self-hosted 4×H100 runner; ``run_smoke_host.sh --stability`` is the
+manual equivalent. At >=1000 steps the acceptance bar tightens to the
+plan's 1 % (measured after a 100-step allocator warmup).
 
 The test parses the captured stdout for the colocate loop's
 ``perf/peak_bytes_allocated`` metric. The loop emits one
@@ -42,13 +45,25 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NUM_STEPS = int(os.environ.get("PHASE6_STABILITY_STEPS", "200"))
-PEAK_ALLOC_TOLERANCE = 0.05  # 5 % under MPS — the plan's 1 % is too tight
-                             # while expandable_segments is still ramping
-                             # up its segment table on the first ~50 steps.
+
+# expandable_segments grows its segment table over the first ~50-100
+# steps; sampling the "early" peak-alloc baseline before it settles
+# inflates the apparent drift. For the nightly 1000-step run we skip
+# that ramp (warmup=100) and hold the plan's 1 % bar; the 200-step
+# smoke can't fully settle, so it keeps the looser 5 % bar against a
+# step-10 baseline.
+_LONG_RUN = NUM_STEPS >= 1000
+WARMUP_STEPS = 100 if _LONG_RUN else 10
+PEAK_ALLOC_TOLERANCE = 0.01 if _LONG_RUN else 0.05
+
+# Setup (clone/patch/install + model download) is ~10-15 min; each
+# colocate step is a few seconds under MPS. Size the budget off the
+# step count so the 1000-step nightly doesn't trip a 200-step timeout.
+_TIMEOUT_S = max(60 * 60, 900 + NUM_STEPS * 6)
 
 pytestmark = [
     pytest.mark.slow,
-    pytest.mark.timeout(60 * 60),  # an hour; sized for 1000 steps under MPS.
+    pytest.mark.timeout(_TIMEOUT_S),
 ]
 
 
@@ -105,7 +120,7 @@ def test_phase6_peak_alloc_flatness():
             "training.num_epochs=1",
         ],
         cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
-        timeout=60 * 60 - 30,
+        timeout=_TIMEOUT_S - 30,
     )
 
     log = proc.stdout + proc.stderr
@@ -119,14 +134,17 @@ def test_phase6_peak_alloc_flatness():
     )
 
     peaks = _extract_peak_alloc(log)
-    early = next((peaks[s] for s in sorted(peaks) if s >= 10), None)
+    early = next((peaks[s] for s in sorted(peaks) if s >= WARMUP_STEPS), None)
     late = max((peaks[s] for s in peaks if s >= NUM_STEPS - 5), default=None)
     assert early is not None and late is not None, (
-        f"could not extract peak-alloc samples from log; got steps={sorted(peaks)}"
+        f"could not extract peak-alloc samples from log "
+        f"(need a step >= {WARMUP_STEPS} for the post-warmup baseline and a "
+        f"step >= {NUM_STEPS - 5} for the late sample); got steps={sorted(peaks)}"
     )
     drift = abs(late - early) / early
     assert drift < PEAK_ALLOC_TOLERANCE, (
-        f"peak-alloc drift {drift:.4f} ({early:.3e} → {late:.3e}) "
-        f"exceeds tolerance {PEAK_ALLOC_TOLERANCE}; suggests memory leak "
-        f"or fragmentation in the colocate path."
+        f"peak-alloc drift {drift:.4f} (step>={WARMUP_STEPS}: {early:.3e} → "
+        f"step>={NUM_STEPS - 5}: {late:.3e}) exceeds tolerance "
+        f"{PEAK_ALLOC_TOLERANCE} over {NUM_STEPS} steps; suggests a memory "
+        f"leak or fragmentation in the colocate path."
     )
