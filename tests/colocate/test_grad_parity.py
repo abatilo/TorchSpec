@@ -114,7 +114,7 @@ def _run_arm(
         "training.num_epochs=1",
         f"training.seed={seed}",
         # Deterministic prompt order so both arms see the same batch.
-        "training.shuffle_dataset=false",
+        "dataset.shuffle_dataset=false",
         # dump_eagle3_batch formats {step}/{rank}/{batch_idx} into this.
         f"debug.save_debug_train_data={dump_dir}/g_{{step}}_{{rank}}_{{batch_idx}}.pt",
         *(extra_args or []),

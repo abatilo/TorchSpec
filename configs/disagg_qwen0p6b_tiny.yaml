@@ -26,6 +26,8 @@ dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
   chat_template: qwen
   prompt_key: conversations
+  # Deterministic prompt order so both grad-parity arms see the same batch.
+  shuffle_dataset: false
 
 training:
   attention_backend: flex_attention
@@ -44,8 +46,6 @@ training:
   ttt_length: 7
   save_per_epoch: false
   warmup_ratio: 0.015
-  # Deterministic prompt order so both parity arms see the same batch.
-  shuffle_dataset: false
   # No colocate flags: transfer_mode defaults to "mooncake" (disagg).
 
 inference:
