@@ -831,6 +831,61 @@ index d0ff3eb8d..cd98d9d3d 100644
              initialize_dp_attention(
                  server_args=self.server_args,
                  model_config=self.model_config,
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+index 0b5e2765d..db106fb47 100644
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -293,9 +293,27 @@ def initialize_dp_attention(
+     from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+ 
+     use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
++    # TorchSpec colocate: a tp_size=1 engine's attn_tp group is the
++    # singleton [engine_union_rank]; sglang computes [head] (-> [0]),
++    # so shift by THIS engine's own union rank (N + paired_trainer_rank),
++    # not just N -- otherwise only engine 0 passes the GroupCoordinator
++    # membership check. Default 0 keeps non-colocate runs byte-identical.
++    try:
++        from sglang.srt.distributed.torchspec_colocate import (
++            is_colocate_active,
++            read_colocate_env,
++        )
++
++        _ts_offset = (
++            read_colocate_env().engine_global_rank()
++            if is_colocate_active()
++            else 0
++        )
++    except Exception:
++        _ts_offset = 0
+     _ATTN_TP_GROUP = GroupCoordinator(
+         [
+-            list(range(head, head + _ATTN_TP_SIZE))
++            list(range(_ts_offset + head, _ts_offset + head + _ATTN_TP_SIZE))
+             for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
+         ],
+         tp_group.local_rank,
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 37416ba8b..d63068c1c 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -289,9 +289,16 @@ class TpModelWorker(BaseTpWorker):
+         ), "Memory pool size is too small"
+ 
+         # Sync random seed across TP workers
++        # TorchSpec colocate: broadcast_pyobj's rank arg is the *global*
++        # rank (src below is also global). In standalone sglang the engine
++        # owns the whole world so tp-local rank == global rank; under
++        # colocate the engine sits at global rank N while its tp-local
++        # rank is 0, so the old `tp_size*pp_rank + tp_rank` made the
++        # engine take the receiver path and IndexError on the empty list.
++        # world_group.rank is the global rank -- correct for both.
+         self.random_seed = broadcast_pyobj(
+             [server_args.random_seed],
+-            self.tp_size * self.pp_rank + tp_rank,
++            self.world_group.rank,
+             self.world_group.cpu_group,
+             src=self.world_group.ranks[0],
+         )[0]
 --
 2.51.2
 

@@ -9,9 +9,21 @@
 > [`patches/sglang/v0.5.8.post1/colocate.patch`](../../patches/sglang/v0.5.8.post1/colocate.patch).**
 > It is applied on top of the existing `sglang.patch` (the disagg
 > patch). The Modal smoke image (`scripts/modal/modal_colocate_smoke.py`)
-> applies both in order. The pseudocode in the rest of this document
-> still describes what the patch does and serves as the upstream-PR
-> spec — see `colocate.patch` for the actual diff.
+> applies both in order; for a local checkout,
+> `./tools/apply_sglang_patch.sh --colocate <sglang-repo>` does the
+> same. The pseudocode in the rest of this document still describes
+> what the patch does and serves as the upstream-PR spec — see
+> `colocate.patch` for the actual diff.
+
+> **Version status.** `patches/sglang/v0.5.8.post1/colocate.patch` is
+> the GPU-verified reference (4×H100 smoke green).
+> `patches/sglang/v0.5.10.post1/colocate.patch` is a forward-port: it
+> applies cleanly and py-compiles, but the colocate NCCL path has
+> **not** been exercised on GPU. `parallel_state.py` was reworked —
+> v0.5.10 restructured `initialize_model_parallel` (new `_ATTN_CP` /
+> MoE-DP groups), so the per-site rank branches were replaced with a
+> uniform engine-logical-world + offset-shift remap. Run the Modal
+> 4×H100 colocate smoke before trusting it.
 
 ## Motivation
 
@@ -58,9 +70,11 @@ sglang. Read them from inside sglang's TP scheduler subprocess:
 
 ## Patch points
 
-The patch is small but lives in three sglang files. Pseudo-paths are
-shown for the layout that's been stable in sglang since ~mid-2024; they
-may shift slightly if the upstream refactor changes.
+The patch spans a handful of sglang files (see
+[`colocate.patch`](../../patches/sglang/v0.5.8.post1/colocate.patch) for
+the actual diff). Pseudo-paths are shown for the layout that's been
+stable in sglang since ~mid-2024; they may shift slightly if the
+upstream refactor changes.
 
 ### 1. Distributed init: `sglang/srt/distributed/parallel_state.py` (or equivalent)
 
@@ -189,6 +203,33 @@ already skips the Mooncake bootstrap. TorchSpec sets the flag from
 [`torchspec/inference/engine/sgl_engine.py`](../../torchspec/inference/engine/sgl_engine.py)
 based on `transfer_mode`. No extra patch needed here as long as the flag
 is honoured.
+
+### 4. Engine rank-offset fixes (`dp_attention.py`, `tp_worker.py`)
+
+Two callsites in sglang assume the engine owns the whole `dist` world
+(global rank == tp-local rank). Under colocate the engine sits at global
+ranks `[N, 2N)`, so both need a global-rank correction. These were
+prototyped as post-patch `sed`-style surgery in `run_smoke_host.sh`
+during validation and are now **folded into `colocate.patch` as proper
+hunks** (2026-05-20) — no out-of-band surgery step remains.
+
+- **`layers/dp_attention.py`** — `_ATTN_TP_GROUP`'s rank list is computed
+  as `range(head, head + _ATTN_TP_SIZE)`, landing in `[0, tp_size)`. For
+  a `tp_size=1` engine that is `[0]`, so only engine 0 passes
+  `GroupCoordinator`'s `self.rank in ranks` membership check and every
+  other engine trips `assert self.cpu_group is not None`. The hunk adds a
+  `_ts_offset` (this engine's own union rank via `engine_global_rank()`,
+  `0` when colocate is inactive) and shifts the range by it.
+- **`managers/tp_worker.py`** — the random-seed `broadcast_pyobj` call
+  passes `tp_size * pp_rank + tp_rank` as the *global* rank argument.
+  That equals the global rank only when the engine owns the whole world;
+  under colocate the engine's tp-local rank is `0` but its global rank is
+  `N`, so it wrongly takes the receiver path and `IndexError`s on the
+  empty result. The hunk passes `world_group.rank` (already the global
+  rank) instead — correct for both colocate and standalone.
+
+Both files are untouched by `sglang.patch` and the other colocate hunks,
+so the diffs apply cleanly stacked on either.
 
 ## Verification
 
