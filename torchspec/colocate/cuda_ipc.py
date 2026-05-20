@@ -27,15 +27,25 @@ transport without a runtime negotiation message.
 
 The ``expandable_segments`` conflict
 ------------------------------------
-``cudaIpcGetMemHandle`` requires a plain ``cudaMalloc`` allocation; it
-fails on the virtual-memory segments produced by
-``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` — which the colocate
-path sets everywhere. :func:`probe_ipc_capability` detects this (and any
-other platform reason IPC can't work) by attempting a real
-``reduce_tensor`` on a scratch CUDA tensor. The connector/fetcher call
-it once at construction and **fail fast** with an actionable message if
-IPC was requested but is unavailable, rather than silently falling back
-(a one-sided fallback would desync the wire protocol).
+CUDA IPC has two memory-sharing paths. For plain ``cudaMalloc`` memory
+it uses the classic ``cudaIpcGetMemHandle`` / ``cudaIpcOpenMemHandle``
+handles, which work in any container. For the virtual-memory segments
+produced by ``expandable_segments:True`` it instead passes the backing
+fd between processes via the ``pidfd_getfd`` syscall — and that needs
+``CAP_SYS_PTRACE``, which typical containers (RunPod, most Docker
+hosts) do not grant, so ``rebuild_cuda_tensor`` fails with
+``pidfd_getfd: Operation not permitted``.
+
+Resolution: when ``TORCHSPEC_COLOCATE_IPC`` is opted in, the colocate
+path (``ray/train_group.py``, ``inference/factory.py``) **does not**
+inject ``expandable_segments`` into the trainer/engine actors, so IPC
+stays on the capability-free classic-handle path. (IPC already avoids
+the H<->D staging churn that ``expandable_segments`` was mitigating.)
+
+:func:`probe_ipc_capability` still runs a ``reduce_tensor`` smoke check
+at construction; the connector/fetcher **fail fast** with an actionable
+message if IPC was requested but is unavailable, rather than silently
+falling back (a one-sided fallback would desync the wire protocol).
 
 Wire protocol
 -------------

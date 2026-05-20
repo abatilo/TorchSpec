@@ -106,14 +106,21 @@ class RayTrainGroup:
         # expandable_segments so two cohabiting CUDA contexts can grow
         # without thrashing the segment table.
         if is_mps_colocate(self.args):
+            from torchspec.colocate.cuda_ipc import ipc_requested
+
             if not getattr(self.args, "colocate_mps_unavailable", False):
                 env_vars.update(mps_client_env())
-            env_vars.setdefault(
-                "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
-            )
-            env_vars.setdefault(
-                "PYTORCH_ALLOC_CONF", "expandable_segments:True"
-            )
+            # Skip expandable_segments when CUDA IPC is opted in: IPC's
+            # classic capability-free handle path needs non-expandable
+            # memory (expandable_segments forces pidfd_getfd, which needs
+            # CAP_SYS_PTRACE — not granted in typical containers).
+            if not ipc_requested():
+                env_vars.setdefault(
+                    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+                )
+                env_vars.setdefault(
+                    "PYTORCH_ALLOC_CONF", "expandable_segments:True"
+                )
 
         TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(
             self._training_class

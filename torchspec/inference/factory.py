@@ -219,13 +219,22 @@ def _prepare_sgl_engines(
     # client env vars + expandable_segments allocator. See Phase 1 in
     # docs/colocate/implementation.md.
     if is_mps_colocate(args):
+        from torchspec.colocate.cuda_ipc import ipc_requested
+
         sgl_num_gpus = float(getattr(args, "infer_frac", 0.45) or 0.45)
         sgl_num_cpus = sgl_num_gpus
-        env_vars = {
-            **env_vars,
-            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-        }
+        # CUDA IPC (TORCHSPEC_COLOCATE_IPC) needs the classic, capability-
+        # free cudaIpc* handle path, which only works on *non*-expandable
+        # memory. expandable_segments forces the pidfd_getfd fd-passing
+        # path, which needs CAP_SYS_PTRACE (not granted in typical
+        # containers). So skip expandable_segments when IPC is opted in —
+        # IPC already avoids the H<->D staging churn it was mitigating.
+        if not ipc_requested():
+            env_vars = {
+                **env_vars,
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            }
         if not getattr(args, "colocate_mps_unavailable", False):
             env_vars.update(mps_client_env())
     else:
