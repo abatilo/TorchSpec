@@ -20,15 +20,23 @@
 |---|---|---|---|---|
 | 0 | Configuration plumbing & feature flag | ✅ | No (unit only) | 18/18 unit tests pass locally |
 | 1 | Placement: 1:1 bundle pairing + MPS env | ✅ | Yes (4×H100) | 5/5 placement tests pass on Modal |
-| 2 | Union NCCL world (no transfer yet) | 🟡 | Yes (8×H100) | helper + 8-rank smoke test pass; trainer/engine wire-up + sglang patch deferred to Phase 4 |
+| 2 | Union NCCL world | ✅ | Yes (8×H100) | helper + 8-rank smoke test pass; trainer/engine wire-up landed with Phase 4 |
 | 3 | NCCL P2P data plane (dummy tensors) | ✅ | Yes (2×H100) | 3/3 P2P dummy tests pass on Modal in 137 s; scaled down from plan's 4-GPU MPS topology — see deviations |
-| 4 | Real hidden-state hook in sglang | 🟢 | Yes (2×H100) | TorchSpec-side library + wiring complete; multi-tensor round-trip Modal test green; sglang patch landed locally + applied inside Modal image build (4/4 patch-surface assertions verified inside the container, see [Modal patch-surface verification](#modal-patch-surface-verification-2026-05-13)). Full one-step still parked behind the sync-loop body (Phase-5 `NotImplementedError`). |
-| 5 | Controller trim & loop integration | 🟢 | Yes (4×H100) | Mooncake-free `setup_colocate_training_with_engines` + `train_entry` branch landed; Phase-5 unit tests (`test_phase5_no_mooncake.py`) green; sync loop body raises `NotImplementedError` until upstream sglang patch lands |
-| 6 | Memory caps, MPS hygiene, stability | 🟢 | Yes (4×H100) | init-order fence + peak-alloc profiler metric + MPS daemon `atexit` cleanup landed; `test_stability.py` skeleton skipped pending upstream sglang patch |
-| 7 | Numeric parity & convergence | 🟢 | Yes (4–8×H100) | `test_grad_parity.py` + `test_convergence.py` skeletons landed (skipped pending upstream sglang patch) |
+| 4 | Real hidden-state hook in sglang | ✅ | Yes (4×H100) | `colocate.patch` vendored in-repo (`patches/sglang/v0.5.8.post1/`); one-step e2e green on 4×H100 (sessions #2–#5) |
+| 5 | Controller trim & loop integration | ✅ | Yes (4×H100) | Mooncake-free setup + the synchronous `colocate_loop.py` body landed; one-step e2e green on 4×H100 |
+| 6 | Memory caps, MPS hygiene, stability | ✅ | Yes (4×H100) | `test_phase6_peak_alloc_flatness` green at 200 steps; 1000-step nightly wired (see follow-ups) |
+| 7 | Numeric parity & convergence | ✅ | Yes (4–8×H100) | `test_phase7_convergence`/`grad_parity_smoke` green; per-parameter `grad_parity_full` added (see follow-ups) |
 | 8 | Docs & examples | ✅ | No | `docs/colocate/usage.md`, `configs/colocate_qwen3_8b.yaml`, `examples/colocate-qwen3-8b-1node/`, and the colocate row in `docs/ray.md` all landed |
 
 Legend: ⬜ pending, 🟡 in progress, ✅ done, ⏭ skipped/deferred.
+
+> **Status note (2026-05-20):** all 8 phases are complete and the
+> `--full` suite is green on 4×H100 (sessions #4–#5). The colocate
+> sglang patch is **vendored in-repo** (`colocate.patch`), not a pending
+> upstream dependency — earlier "pending upstream patch" / phase-5
+> `NotImplementedError` notes are superseded by sessions #1–#5 below.
+> See the [PR #92 follow-up section](#follow-up-issues--pr-92-review-items-2026-05-20)
+> for the latest review-driven work.
 
 ---
 
@@ -1696,3 +1704,106 @@ became permanently unrestartable after a few hours stopped (the host
 re-rented). **Recommendation:** for any pod whose disk holds work you
 need to come back to, either keep it running, or `scp` the artifacts off
 first and accept the disk loss.
+
+---
+
+## Follow-up issues — PR #92 review items (2026-05-20)
+
+After the full `--full` suite went green (sessions #4–#5), a review of
+PR #92 against issue #81's validation plan identified seven follow-ups.
+All were implemented on `feature/colocate-training-inference` in one
+pass; GPU validation is incremental (see the validation matrix below).
+
+| # | Item | Commit | Status |
+|---|------|--------|--------|
+| P3 | Fold dp_attention + tp_worker sed-surgery into `colocate.patch` | `626d9ab` | ✅ verified locally |
+| P2a | 1000-step nightly stability (test + `--stability` + CI workflow) | `faca9b9` | 🟢 code; nightly is its own run |
+| P0 | Per-parameter grad parity vs disagg + deterministic-seed plumbing | `57560d0` | 🟢 code + unit tests; e2e GPU pending |
+| P1a | Colocate checkpoint save/resume test (+ unreachable-save-path fix) | `4472bcc` | 🟢 code; GPU pending |
+| P1b | CUDA IPC zero-copy hidden-state transport (opt-in) | `1bb8023` | 🟢 code + unit tests; GPU pending |
+| P2b | Multi-engine TP union-world rank math (`engine_tp_size > 1`) | `8ef6d26` | 🟡 rank math done; data-plane pending |
+| P2c | Multi-node colocate (per-node MPS bootstrap + 2-node config) | `cddd140` | 🟡 code; single-node sim only |
+
+### P3 — fold the sglang post-patch surgery
+
+The `dp_attention.py` `_ATTN_TP_GROUP` rank-offset and the
+`tp_worker.py` `broadcast_pyobj` global-rank fix (RunPod iter-8 /
+iter-16 discoveries) were carried as `sed`-style string substitution in
+`run_smoke_host.sh` — invisible to the Modal image and
+`apply_sglang_patch.sh`. Both files are untouched by `sglang.patch` and
+the other colocate hunks, so the diffs were generated against the
+pinned commit and appended to `colocate.patch` (now 7 files). The
+101-line surgery block was removed from `run_smoke_host.sh`;
+`apply_sglang_patch.sh` gained a `--colocate` mode. Verified:
+`apply_sglang_patch.sh --colocate` applies both patches clean against a
+worktree at the pinned commit.
+
+### P0 — grad parity vs disagg
+
+The engine runs prefill-only (`max_new_tokens=0`), so there is no
+sampling RNG — determinism reduces to model-init seed + data order.
+`torchspec/colocate/determinism.py` `seed_everything()` seeds
+torch/cuda/numpy/random and, under `TORCHSPEC_GRAD_PARITY`, pins
+deterministic kernels. `test_grad_parity.py` gained
+`test_phase7_grad_parity_determinism` (colocate ×2, bit-identical
+grads — 1 GPU) and `test_phase7_grad_parity_full` (disagg vs colocate,
+dp_size=1 so FSDP is a no-op and the transport is the only variable —
+≥2 GPUs + Mooncake). `configs/disagg_qwen0p6b_tiny.yaml` is the
+baseline arm.
+
+### P1a — checkpoint save/resume
+
+Found a real bug: the colocate loop gated saving on
+`getattr(args, "save_steps", 0)`, but `save_steps` is not a config
+field — so the save path (and commit `59400f1`'s `dcp` `process_group=`
+fix) was unreachable dead code. The loop now uses the real
+`save_interval` knob, identical to the disagg loop.
+`test_colocate_checkpoint.py` exercises save + resume.
+
+### P1b — CUDA IPC transport
+
+`torchspec/colocate/cuda_ipc.py` ships a zero-copy alternative to the
+gloo CPU-staged transport: the engine exports CUDA IPC handles, the
+trainer maps the memory and does an on-device D→D copy. Opt-in via
+`TORCHSPEC_COLOCATE_IPC=1`. CUDA IPC is incompatible with
+`expandable_segments:True` (which colocate sets everywhere) — the
+module probes this and fails fast rather than silently desyncing the
+two sides.
+
+### P2b — multi-engine TP
+
+`ColocateEnv.engine_global_rank` / `build_engine_tp_ranks` in
+`colocate.patch` were scoped to `engine_tp_size == 1`. They now return
+the contiguous `[N+base, N+base+tp)` union-world block for any TP size;
+at `tp == 1` the result is byte-identical to before. The remaining work
+for a runnable `tp > 1` is the data plane — partitioning each step's
+requests across an engine's TP ranks in the scheduler plus the matching
+colocate-loop dispatch — which needs GPU-iterated development.
+
+### P2c — multi-node
+
+The rank math and gloo transport were already global-world-size based;
+the one single-node assumption was MPS bring-up.
+`mps.ensure_mps_on_all_nodes()` bootstraps the daemon on every Ray node
+(node-affinity tasks); `train_entry` calls it when
+`training_num_nodes > 1`, so single-node is byte-for-byte unchanged.
+`configs/colocate_qwen3_8b_2node.yaml` is the 2-node example. Per the
+agreed scope this is code + single-node simulation only — a true 2-node
+run is untested.
+
+### Validation matrix (follow-ups)
+
+| Test / check | GPU shape | Status |
+|--------------|-----------|--------|
+| Mac unit suite (`tests/colocate/`) | none | ✅ 71 passed / 43 skipped |
+| `apply_sglang_patch.sh --colocate` round-trip | none | ✅ verified |
+| Multi-engine TP rank math (tp=1, tp=2) | none | ✅ verified vs patched module |
+| `test_phase7_grad_parity_determinism` | 1×H100 + MPS | ⬜ pending |
+| `test_colocate_checkpoint_{save,resume}` | 1×H100 + MPS | ⬜ pending |
+| CUDA IPC path (`TORCHSPEC_COLOCATE_IPC=1`) | 1×H100, no expandable_segments | ⬜ pending |
+| `test_phase7_grad_parity_full` | 2×H100 + MPS + Mooncake | ⬜ pending |
+| 1000-step stability | 4×H100 (nightly) | ⬜ pending |
+
+GPU availability re-checked 2026-05-20: RunPod H100/H200/B200 in stock
+across ~13 datacenters; Vast 1×H100 from $2.40/hr, 2×H100 $4.80/hr,
+4×H100 $10.56/hr.

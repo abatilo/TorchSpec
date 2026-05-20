@@ -210,22 +210,43 @@ patch. Anything still ⬜ in that doc is gated on it.
 
 ## Known limitations
 
-- **Single-node only.** No multi-node colocate.
+- **Multi-node is implemented but untested at scale.** The union-world
+  rank math and gloo transport are global-world-size based, and
+  `mps.ensure_mps_on_all_nodes()` bootstraps the MPS daemon on every
+  Ray node; `configs/colocate_qwen3_8b_2node.yaml` is the 2-node
+  example. A true 2-node run has not been validated — single-node is
+  the only exercised path.
+- **Engine `tp_size > 1` is partial.** The union-world rank math
+  (`engine_global_rank`, `build_engine_tp_ranks`) handles any TP size,
+  but the data plane — partitioning each step's requests across an
+  engine's TP ranks — is not wired. Use `inference_num_gpus_per_engine=1`.
 - **sglang only.** No vLLM colocate path; nothing in
   `mooncake_hidden_states_connector.py` (vLLM KV connector) is
   affected.
 - **No async pipelining.** The colocate step loop is strictly
   synchronous. Async + colocate is explicitly Phase ∞ in
   [`implementation.md`](implementation.md).
-- **Upstream sglang patch is required** to actually run a step. Without
-  it, `train_entry` will reach the synchronous loop and currently
-  raises `NotImplementedError("colocate sync loop pending upstream sglang patch")`
-  — that error is the diagnostic, not a bug.
 - **No `eval` parity yet.** `set_eval_queue` reuses the colocate fetcher
-  but the eval step driver is still in flight (Phase 5/7 follow-up).
+  but the eval step driver is still in flight.
 - **`USP` (unified sequence parallel) is not supported under colocate.**
   Combining USP with the union-world FSDP subgroup is left as future
   work; `TrainerActor.init` errors out fast if both flags are set.
+
+### Hidden-state transport (gloo default, CUDA IPC opt-in)
+
+The engine→trainer hidden-state plane defaults to a **gloo
+CPU-staged** transport (engine D→H copy, gloo ship, trainer H→D copy):
+NCCL cannot form a communicator with two ranks on one physical GPU.
+
+Set **`TORCHSPEC_COLOCATE_IPC=1`** to use the **CUDA IPC** transport
+instead — the engine exports a CUDA IPC handle per tensor and the
+trainer maps the memory directly, doing a single on-device D→D copy
+(no host round-trip). It is opt-in because CUDA IPC needs plain
+`cudaMalloc` memory and **fails on `expandable_segments:True`** (which
+colocate sets by default). On an incompatible host the connector
+fails fast at construction with an actionable message; either drop
+`expandable_segments` for the run or leave `TORCHSPEC_COLOCATE_IPC`
+unset.
 
 ## Troubleshooting
 
