@@ -54,6 +54,7 @@ from torchspec.utils.distributed import (
     get_usp_device_mesh,
     get_usp_grad_sync_mesh,
 )
+from torchspec.colocate.determinism import seed_everything
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -72,7 +73,10 @@ class Trainer(abc.ABC):
         self.args = args
 
         self._setup_device_mesh()
-        torch.manual_seed(getattr(args, "seed", 42))
+        # Seeds torch/cuda/numpy/random; under TORCHSPEC_GRAD_PARITY also
+        # pins deterministic kernels so the Phase-7 grad-parity arms are
+        # bit-reproducible. No-op cost difference for production runs.
+        seed_everything(getattr(args, "seed", 42))
 
         self.fsdp_cpu_offload = getattr(args, "fsdp_cpu_offload", False)
 

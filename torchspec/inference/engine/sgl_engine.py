@@ -361,6 +361,11 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 "trust_remote_code": getattr(self.args, "trust_remote_code", True),
                 "chunked_prefill_size": -1,
                 "allow_auto_truncate": True,
+                # Pin sglang's RNG to training.seed. The colocate engine
+                # runs prefill-only (max_new_tokens=0) so this does not
+                # affect generation, but it keeps any incidental engine-side
+                # RNG reproducible across the Phase-7 grad-parity arms.
+                "random_seed": int(getattr(self.args, "seed", 42)),
                 **({"context_length": max_seq_length} if max_seq_length else {}),
                 **(
                     {"spec_training_store_last_hidden_states": False}
