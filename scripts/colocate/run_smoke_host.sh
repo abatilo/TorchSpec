@@ -316,6 +316,7 @@ pick_test_files() {
       "tests/colocate/test_colocate_checkpoint.py"
       "tests/colocate/test_colocate_ipc.py"
       "tests/colocate/test_colocate_tp2.py"
+      "tests/colocate/test_colocate_multi_engine.py"
       "tests/colocate/test_stability.py"
       "tests/colocate/test_convergence.py"
     )
