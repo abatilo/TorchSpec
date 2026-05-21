@@ -2071,3 +2071,56 @@ third-party-lib bug, not a missing TorchSpec capability.
   `mooncake-transfer-engine` version (or import-order change) that
   doesn't crash; the colocate gloo-vs-IPC parity test covers the
   numeric question in the meantime.
+
+## Follow-up round 5 — v0.5.10.post1 forward-port GPU validation (2026-05-21, RunPod)
+
+Completes the round-4 tracked follow-up "v0.5.10 patch multi-TP". The
+colocate patch was forward-ported to sglang v0.5.10.post1 and validated
+on RunPod H100s.
+
+### The forward-port
+
+`patches/sglang/v0.5.10.post1/colocate.patch` is regenerated from the
+current `v0.5.8.post1/colocate.patch` (the maintained reference) onto
+v0.5.10.post1 + the disagg `sglang.patch`. v0.5.10 restructured
+`initialize_model_parallel` — new `_ATTN_CP` / `_ATTN_TP` / MoE-DP
+groups vs v0.5.8 — so the v0.5.8 patch's per-site colocate rank
+branches do not apply. They were replaced with a single uniform
+mechanism: run the group arithmetic against an engine-logical world of
+size `N = len(tp_world_ranks)` (so every `range()` stays 0-based), then
+shift every constructed group by `colocate_rank_offset` onto the
+engine's real `[N, 2N)` union ranks. One `_maybe_colocate_shift()`
+helper wraps all 8 group-construction sites. The `dp_attention.py` hunk
+is dropped — v0.5.10 moved that group into `initialize_model_parallel`,
+where the shift already covers it.
+
+### GPU validation (RunPod)
+
+| Test | Host | Result |
+|---|---|---|
+| `test_colocate_tiny.py` | 1×H100 SXM | **2/2 PASSED** — tp_size=1, loss 12.02 → 9.74 over 20 steps |
+| `test_colocate_tp2.py` | 2×H100 SXM | **PASSED** — engine_tp_size=2, 2 engine TP ranks, loss 12.04 → 11.37 over 5 steps |
+
+`test_colocate_tp2.py` is the meaningful one for the port: it exercises
+the offset-shift group arithmetic across >1 engine TP rank. Still
+unexercised on v0.5.10: `pp_size>1` (blocked by an explicit guard) and
+the Qwen3-8B-scale 4×H100 `--full` matrix.
+
+### Host fixes (not part of the patch)
+
+* **`libnuma`** — already handled by `d6431d2` (`run_smoke_host.sh`
+  apt-installs it). Round-4's fix carries over.
+* **RoPE `_init_rope`** — `torchspec/models/draft/llama3_eagle.py`
+  rejected `rope_scaling={"rope_type": "default"}` (transformers ≥4.x's
+  normalised "no scaling"), blocking every colocate test. Fixed in
+  `be399a0` — treat `"default"` as standard RoPE.
+
+### On the v0.5.8 ↔ v0.5.10 relationship
+
+`v0.5.10.post1/colocate.patch` is a *derived forward-port* of
+`v0.5.8.post1/colocate.patch`, not an independent artifact: the v0.5.8
+patch is the maintained source, so every change to it (e.g. `6e74ffc`'s
+`engine_tp_size>1` MoE-EP fix) requires re-deriving v0.5.10. The two
+become independent only by retiring one — once v0.5.10 passes full
+validation and nothing else pins v0.5.8 (Modal smoke, `docker/sglang/`),
+v0.5.10 should become the sole maintained patch.
