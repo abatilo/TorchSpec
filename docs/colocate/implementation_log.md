@@ -1961,7 +1961,8 @@ Added `configs/colocate_qwen0p6b_2eng_tp2_tiny.yaml` (2 engines, each
 tp=2, dp_size=4, union world 2N=8 on 4 MPS-shared GPUs) and
 `tests/colocate/test_colocate_multi_engine.py`, asserting 5 steps
 complete with a decreasing loss. Wired into `run_smoke_host.sh --full`;
-self-skips below 4 GPUs. **Not yet GPU-validated** — needs a 4-GPU host run.
+self-skips below 4 GPUs. **GPU-validated 2026-05-20 on RunPod 4×H100 —
+see round 4 below.**
 
 ### Mooncake-disagg crash diagnostic harness (`a7d4436`)
 
@@ -1977,9 +1978,9 @@ it) we need the real crash signature. Added:
   `PYTHONFAULTHANDLER`, and post-mortems the Go traceback, dmesg
   segfault line, and gdb backtrace into `mooncake-crash-report.txt`.
 
-Mooncake already defaults to `protocol=tcp`, so the crash is an
-environment problem (container seccomp / kernel / glibc), not RDMA. This
-unblocks — but does not yet close — the literal vs-disagg grad parity.
+Mooncake already defaults to `protocol=tcp`, so the crash is not an RDMA
+problem. **Round 4 ran this harness and found it is not a host problem
+either** — see below.
 
 ### Tracked follow-ups after round 3
 
@@ -1990,3 +1991,83 @@ unblocks — but does not yet close — the literal vs-disagg grad parity.
   4-GPU host.
 * **Mooncake-disagg grad parity** — run `diagnose_mooncake_crash.sh` to
   find/fix a non-crashing host, then the literal vs-disagg comparison.
+
+---
+
+## Follow-up round 4 — GPU validation of round 3 (2026-05-20, RunPod 4×H100)
+
+A single RunPod 4×H100 pod (`runpod/pytorch:2.4.0` image) was set up once
+and ran both remaining round-3 GPU items.
+
+### Multi-engine fan-out — VALIDATED
+
+`tests/colocate/test_colocate_multi_engine.py::test_colocate_multi_engine_tp2_end_to_end`
+**PASSED** (1 passed in 120.67s) — 2 engines × `engine_tp_size=2`,
+dp_size=4, union world 2N=8 across 4 MPS-shared H100s. The test asserts
+5 steps complete and the loss strictly decreases, so the colocate loop's
+`for e in range(n_engines)` per-engine dispatch and the per-engine base
+paired-rank routing are both confirmed correct at `n_engines > 1`.
+
+**`run_smoke_host.sh` gap fixed (`d6431d2`).** The first attempt failed
+because `sgl_kernel`'s prebuilt sm90 `.so` links `libnuma`, and
+sgl_kernel ≥ 0.3.x hard-fails to load without `libnuma.so.1` — surfacing
+as an opaque `"[sgl_kernel] CRITICAL: Could not load any common_ops
+library"` in the engine subprocess. The `runpod/pytorch` devel image
+ships neither `libnuma` nor the RDMA verbs stack. `run_smoke_host.sh`
+now apt-installs both (`setup_system_libs`) before building sglang; the
+re-run passed.
+
+### Mooncake-disagg crash — diagnosed: a Go/CGO signal conflict, not a host problem
+
+`diagnose_mooncake_crash.sh` ran the disagg path (`disagg_qwen0p6b_tiny.yaml`)
+under `GOTRACEBACK=crash`. Result:
+
+```
+(TrainerActor pid=30836) !!!!!!! Segfault encountered !!!!!!!
+(TrainerActor pid=30836)   File ".../go1.25.9.../runtime/sys_linux_amd64.s",
+                            line 330, in runtime.sigfwd
+```
+
+**Root cause.** The `TrainerActor` process SIGSEGVs inside Go's
+`runtime.sigfwd` — the Go runtime's signal-forwarding trampoline. That
+Go runtime is **`go1.25.9`, bundled inside `libetcd_wrapper.so`**, which
+`mooncake/engine.so` dlopens unconditionally (confirmed via `ldd`). When
+`import mooncake.store` loads it into a process that already has
+PyTorch/CUDA, the Go runtime installs its own `SIGSEGV`/`SIGBUS` handlers
+and chains to the pre-existing ones via `sigfwd`; that chaining collides
+with PyTorch/CUDA's handlers and a signal that reaches `sigfwd` faults.
+Mooncake's data transfers all **succeeded** ("All transfers completed
+successfully") before the crash — it is not a transport failure.
+
+**It is not a host problem.** Host fingerprint: stock Ubuntu 22.04.5
+Docker container, kernel 6.8, glibc 2.35, default Docker seccomp, no
+RDMA NICs, `protocol=tcp`. Nothing host-specific is implicated — the
+conflict lives in the *process* (Go runtime + PyTorch in one address
+space), so a different host (bare metal, hyperscaler, more caps) does
+**not** fix it. This corrects the round-3 guess that it was a
+"container seccomp / kernel / glibc" problem.
+
+**`GODEBUG=asyncpreemptoff=1` does not fix it.** Disabling Go's
+SIGURG-based async preemption (the usual Go-embedded-in-C culprit) was
+tried — the run reproduced the identical `runtime.sigfwd` SIGSEGV.
+
+**Implication.** The remaining fix avenues are process-internal, not
+host selection: (a) pin an older `mooncake-transfer-engine` built with
+an older Go toolchain (installed here: `0.3.10.post2` / go1.25.9);
+(b) control Mooncake-vs-torch import order so Go installs handlers
+first; or (c) accept that this third-party fragility is exactly what
+colocate was built to remove — the reframed gloo-vs-CUDA-IPC
+`grad_parity_full` already gives host-independent per-parameter parity
+coverage. The literal vs-Mooncake-disagg comparison is parked behind a
+third-party-lib bug, not a missing TorchSpec capability.
+
+### Tracked follow-ups after round 4
+
+* **Multi-node colocate** — code-complete, untested; needs a 2-node cluster.
+* **v0.5.10 patch multi-TP** — port `build_hidden_states_writer` /
+  `_send_hidden_states_to_nccl` into `v0.5.10.post1/colocate.patch`.
+* **Mooncake-disagg grad parity** — blocked on a third-party Go/CGO
+  signal-handler bug (see above), not on host availability. Needs a
+  `mooncake-transfer-engine` version (or import-order change) that
+  doesn't crash; the colocate gloo-vs-IPC parity test covers the
+  numeric question in the meantime.
