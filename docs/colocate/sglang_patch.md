@@ -16,14 +16,71 @@
 > `colocate.patch` for the actual diff.
 
 > **Version status.** `patches/sglang/v0.5.8.post1/colocate.patch` is
-> the GPU-verified reference (4×H100 smoke green).
-> `patches/sglang/v0.5.10.post1/colocate.patch` is a forward-port: it
-> applies cleanly and py-compiles, but the colocate NCCL path has
-> **not** been exercised on GPU. `parallel_state.py` was reworked —
-> v0.5.10 restructured `initialize_model_parallel` (new `_ATTN_CP` /
-> MoE-DP groups), so the per-site rank branches were replaced with a
-> uniform engine-logical-world + offset-shift remap. Run the Modal
-> 4×H100 colocate smoke before trusting it.
+> the original GPU-verified reference. `patches/sglang/v0.5.10.post1/colocate.patch`
+> is a forward-port — `parallel_state.py` was reworked (v0.5.10
+> restructured `initialize_model_parallel` with new `_ATTN_CP` /
+> `_ATTN_TP` / MoE-DP groups, so the per-site rank branches became a
+> uniform engine-logical-world + offset-shift remap; the
+> `dp_attention.py` hunk is dropped because v0.5.10 moved that group
+> into `initialize_model_parallel`).
+>
+> **GPU-tested 2026-05-21 on 1×H100 (RunPod): `test_colocate_tiny.py`
+> passes 2/2** with `SGLANG_PATCH_VERSION=v0.5.10.post1` — the engine
+> joins the union NCCL world, hidden states move over NCCL P2P, and
+> training loss decreases monotonically (12.02 → 9.74 over 20 steps).
+> This covers the **tp_size=1** colocate path. The **tp>1** path — where
+> the `parallel_state.py` group-arithmetic rework actually matters — is
+> **not yet exercised**; that needs the full 4×H100 matrix
+> (`run_smoke_host.sh --full`). Two host-side fixes were needed and are
+> *not* part of this patch: `apt-get install libnuma1` (missing from the
+> RunPod `runpod-torch-v240` image), and a TorchSpec `_init_rope` fix
+> for transformers' `rope_type="default"`. See
+> [Testing the v0.5.10.post1 forward-port](#testing-the-v0510post1-forward-port).
+
+## Testing the v0.5.10.post1 forward-port
+
+> **Modal cannot run this.** The colocate path needs NVIDIA MPS, and
+> Modal sandbox runs containers under gVisor, whose nvproxy
+> [does not implement MPS multiplexing](https://github.com/google/gvisor/blob/master/g3doc/proposals/nvidia_driver_proxy.md).
+> On Modal the MPS-dependent tests (`phase4_one_step`, `phase6`,
+> `phase7`) `pytest.skip` instead of running — see
+> [`implementation_log.md`](implementation_log.md)
+> §"Cheap-host workflow for MPS-required validation". The patch must be
+> tested on a host that passes `--ipc=host` to its container: Vast.ai,
+> RunPod *Interactive* Pod, Lambda, Hyperstack, or bare-metal.
+
+**Cheap-host recipe (~$2, ~25 min).** Rent a **1×H100** instance (sm90
+— L40S / A6000 / 4090 are rejected by the bundled `sgl_kernel` wheel,
+see [`cheap_host_test_plan.md`](cheap_host_test_plan.md)) with
+`--ipc=host`, then:
+
+```bash
+git clone https://github.com/zhubohao911/TorchSpec.git
+cd TorchSpec
+git checkout feature/colocate-training-inference
+
+# Point the smoke runner at the v0.5.10.post1 patch dir + base commit.
+SGLANG_PATCH_VERSION=v0.5.10.post1 \
+SGLANG_COMMIT=94f03a39dbd39edfc2b118b5357bbbadaaa9ad28 \
+    bash scripts/colocate/run_smoke_host.sh
+```
+
+`run_smoke_host.sh` clones sglang at `SGLANG_COMMIT`, applies
+`patches/sglang/v0.5.10.post1/{sglang,colocate}.patch`, installs
+torchspec + sglang, and runs `tests/colocate/test_colocate_tiny.py`
+(Qwen3-0.6B; 1 GPU shared by 1 trainer + 1 engine over MPS) — which
+exercises the full colocate sync loop including the sglang patch's
+hidden-state hook.
+
+**Success:** the script exits `0`, the pytest summary shows the tiny
+test `PASSED` (not `SKIPPED`), and `colocate-smoke-report.txt` has a
+decreasing `[colocate_loop] step=…` loss progression. **Failure
+signature:** a wrong distributed-wiring patch **hangs on the first P2P
+recv** (see [§Verification](#verification)); the report's pytest tail
+captures the hang.
+
+For the full 4-GPU suite (Phase 4 / 6 / 7, Qwen3-8B) use a 4×H100
+`--ipc=host` host and add `--full` — same two env vars.
 
 ## Motivation
 
@@ -233,16 +290,13 @@ so the diffs apply cleanly stacked on either.
 
 ## Verification
 
-After the patch lands:
-
-```bash
-modal run --env sandbox \
-    scripts/modal/modal_colocate_smoke.py::phase4_one_step
-```
-
-This runs `tests/colocate/test_one_step.py` end-to-end on a 4×H100 box:
-1 engine × TP=4 + 4 trainers × FSDP=4, all sharing GPUs via MPS, hidden
-states moving over the union world. The plan's §Phase 4 done-criterion
+After the patch lands, run the colocate smoke on an `--ipc=host` GPU
+host — **not** Modal; see
+[Testing the v0.5.10.post1 forward-port](#testing-the-v0510post1-forward-port)
+for why and the exact command. The Phase-4 end-to-end test
+(`tests/colocate/test_one_step.py`) runs on a 4×H100 box: 1 engine ×
+TP=4 + 4 trainers × FSDP=4, all sharing GPUs via MPS, hidden states
+moving over the union world. The plan's §Phase 4 done-criterion
 ("loss is finite and non-zero") is checked there.
 
 Without the patch, that test will **hang on the first P2P recv** because
