@@ -245,6 +245,26 @@ run_preflight() {
 # Setup
 # ---------------------------------------------------------------------------
 
+setup_system_libs() {
+  # sgl_kernel's prebuilt sm90 .so dynamically links libnuma; recent
+  # sgl_kernel builds (>=0.3.x) hard-fail to load without it. Mooncake's
+  # transfer-engine .so links the RDMA verbs userspace stack. Neither is
+  # guaranteed on a bare CUDA base image, so install both up front —
+  # otherwise the engine subprocess dies with an opaque
+  #   "[sgl_kernel] CRITICAL: Could not load any common_ops library"
+  # (root cause: libnuma.so.1 not found) at first import.
+  if ! command -v apt-get >/dev/null 2>&1; then
+    banner "system libs: no apt-get — skipping (ensure libnuma/libibverbs present)"
+    return 0
+  fi
+  banner "system libs: libnuma + RDMA verbs stack"
+  apt-get update -qq >/dev/null 2>&1 || true
+  apt-get install -y -qq \
+    libnuma1 libibverbs1 librdmacm1 libnl-3-200 libnl-route-3-200 \
+    ibverbs-providers >/dev/null 2>&1 \
+    || echo "WARNING: apt-get install of system libs failed (continuing)"
+}
+
 setup_sglang() {
   banner "sglang: clone + apply patches"
   if [[ ! -d "$SGLANG_DIR" ]]; then
@@ -413,6 +433,7 @@ if [[ $DO_RUN -eq 1 ]]; then
 fi
 
 if [[ $DO_SETUP -eq 1 ]]; then
+  setup_system_libs
   setup_sglang
   setup_python
 else
