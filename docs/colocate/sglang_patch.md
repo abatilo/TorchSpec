@@ -24,13 +24,17 @@
 > `dp_attention.py` hunk is dropped because v0.5.10 moved that group
 > into `initialize_model_parallel`).
 >
-> **GPU-tested 2026-05-21 on 1×H100 (RunPod): `test_colocate_tiny.py`
-> passes 2/2** with `SGLANG_PATCH_VERSION=v0.5.10.post1` — the engine
-> joins the union NCCL world, hidden states move over NCCL P2P, and
-> training loss decreases monotonically (12.02 → 9.74 over 20 steps).
-> This covers the **tp_size=1** colocate path. The **tp>1** path — where
-> the `parallel_state.py` group-arithmetic rework actually matters — is
-> **not yet exercised**; that needs the full 4×H100 matrix
+> **GPU-tested 2026-05-21 on RunPod H100s** with
+> `SGLANG_PATCH_VERSION=v0.5.10.post1`:
+> - `test_colocate_tiny.py` — 2/2 passed on 1×H100 (**tp_size=1**): the
+>   engine joins the union NCCL world, hidden states move over NCCL
+>   P2P, loss decreases 12.02 → 9.74 over 20 steps.
+> - `test_colocate_tp2.py` — passed on 2×H100 (**engine_tp_size=2**):
+>   2 engine TP ranks, exercising the `parallel_state.py` offset-shift
+>   group-arithmetic rework; loss decreases 12.04 → 11.37 over 5 steps.
+>
+> Still unexercised: pipeline parallelism (`pp_size>1`, blocked by an
+> explicit guard) and the Qwen3-8B-scale 4×H100 matrix
 > (`run_smoke_host.sh --full`). Two host-side fixes were needed and are
 > *not* part of this patch: `apt-get install libnuma1` (missing from the
 > RunPod `runpod-torch-v240` image), and a TorchSpec `_init_rope` fix
