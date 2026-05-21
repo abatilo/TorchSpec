@@ -24,6 +24,16 @@ from typing import Any, Dict, Optional
 
 import torch
 
+# NOTE: `mooncake-transfer-engine` is pinned to *exactly* 0.3.10.post1 in
+# pyproject.toml — do not loosen it to a `>=` range. 0.3.10.post2 is the
+# same Mooncake release rebuilt with the go1.25 toolchain, whose runtime
+# SIGSEGVs in `runtime.sigfwd` once `libetcd_wrapper.so`'s Go signal
+# handlers are loaded alongside PyTorch/CUDA in one process — it crashes
+# the disagg TrainerActor before the first training step (GPU-confirmed
+# 2026-05-20; see docs/colocate/implementation_log.md "Follow-up round
+# 6"). post1 (go1.24.13) runs clean. Every newer wheel will likely also
+# ship on go1.25, so the pin is exact, not a ceiling — revisit only when
+# Mooncake publishes a non-crashing go1.25 build.
 try:
     from mooncake.store import MooncakeDistributedStore
 except ImportError as _mooncake_import_err:
