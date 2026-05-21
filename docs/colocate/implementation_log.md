@@ -1929,3 +1929,64 @@ branch). Re-ran → PASSED.
 * **Mooncake-disagg grad parity** — the literal "vs disagg" comparison
   from the design doc; needs a host where Mooncake's transfer engine
   runs without crashing.
+
+---
+
+## Follow-up round 3 — v0.5.10 patch port + multi-engine fan-out + Mooncake crash harness (2026-05-20)
+
+Three of the round-2 tracked follow-ups were picked up the same evening.
+
+### v0.5.10.post1/colocate.patch — forward-ported (`af68196`)
+
+`patches/sglang/v0.5.10.post1/colocate.patch` was regenerated from the
+current `v0.5.8.post1/colocate.patch` onto sglang v0.5.10.post1 + disagg.
+v0.5.10 restructured `initialize_model_parallel` (new
+`_ATTN_CP` / `_ATTN_TP` / MoE-DP groups), so `parallel_state.py` now uses
+a uniform engine-logical-world + offset-shift remap across all 8 group
+sites instead of per-site rank branches; the `dp_attention.py` hunk is
+dropped because v0.5.10 moved that group into `initialize_model_parallel`.
+
+**GPU-tested 2026-05-20 (RunPod 1×H100):** `test_colocate_tiny.py` passes
+2/2 with `SGLANG_PATCH_VERSION=v0.5.10.post1` (tp_size=1). The v0.5.10
+test recipe + per-version status are recorded in
+`docs/colocate/sglang_patch.md`. **Still open:** the multi-TP
+`build_hidden_states_writer` / `_send_hidden_states_to_nccl` changes are
+not yet ported into the v0.5.10 patch — `tp>1` there is untested.
+
+### Multi-engine fan-out test — n_engines > 1 (`444903e`)
+
+`test_colocate_tp2` only covers a single tp=2 engine — it never runs the
+colocate loop's `for e in range(n_engines)` dispatch with `n_engines > 1`.
+Added `configs/colocate_qwen0p6b_2eng_tp2_tiny.yaml` (2 engines, each
+tp=2, dp_size=4, union world 2N=8 on 4 MPS-shared GPUs) and
+`tests/colocate/test_colocate_multi_engine.py`, asserting 5 steps
+complete with a decreasing loss. Wired into `run_smoke_host.sh --full`;
+self-skips below 4 GPUs. **Not yet GPU-validated** — needs a 4-GPU host run.
+
+### Mooncake-disagg crash diagnostic harness (`a7d4436`)
+
+The disagg grad-parity baseline arm SIGSEGVs in the Mooncake transfer
+engine on rental hosts. To pick a host where it doesn't crash (or to fix
+it) we need the real crash signature. Added:
+
+* `configs/disagg_qwen0p6b_tiny.yaml` restored (the dp_size=1 disagg
+  baseline removed in `c8cf721` with the grad_parity reframe).
+* `scripts/colocate/diagnose_mooncake_crash.sh` — fingerprints the host
+  (OS, glibc, seccomp/caps, cgroup, RDMA surface, Mooncake build), runs
+  the disagg path under `GOTRACEBACK=crash` + core dumps +
+  `PYTHONFAULTHANDLER`, and post-mortems the Go traceback, dmesg
+  segfault line, and gdb backtrace into `mooncake-crash-report.txt`.
+
+Mooncake already defaults to `protocol=tcp`, so the crash is an
+environment problem (container seccomp / kernel / glibc), not RDMA. This
+unblocks — but does not yet close — the literal vs-disagg grad parity.
+
+### Tracked follow-ups after round 3
+
+* **Multi-node colocate** — code-complete, untested; needs a 2-node cluster.
+* **v0.5.10 patch multi-TP** — port `build_hidden_states_writer` /
+  `_send_hidden_states_to_nccl` into `v0.5.10.post1/colocate.patch`.
+* **Multi-engine fan-out GPU run** — `test_colocate_multi_engine.py` on a
+  4-GPU host.
+* **Mooncake-disagg grad parity** — run `diagnose_mooncake_crash.sh` to
+  find/fix a non-crashing host, then the literal vs-disagg comparison.
