@@ -2073,7 +2073,11 @@ the disagg path (`disagg_qwen0p6b_tiny.yaml`, 2 steps) **completed
 cleanly** — `Training: 100% 2/2`, loss 12.073 → 11.604, checkpoint
 saved, **no `Segfault encountered` / `runtime.sigfwd` / `SIGSEGV`**.
 The same run on `0.3.10.post2` dies before step 1. `pyproject.toml` is
-pinned exactly to `==0.3.10.post1`; revisit when Mooncake ships a
+pinned exactly to `==0.3.10.post1` — an exact pin, not a `>=` ceiling,
+because every newer wheel will likely also ship on go1.25. The rationale
+is documented at both the pin (`pyproject.toml`) and the load site
+(`torchspec/transfer/mooncake/store.py`, next to the
+`from mooncake.store import …`). Revisit when Mooncake ships a
 non-crashing go1.25 build.
 
 This **unblocks** the literal vs-Mooncake-disagg grad-parity comparison
