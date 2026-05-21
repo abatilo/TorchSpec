@@ -148,12 +148,17 @@ def run_colocate_training_loop(
         or args.training_num_nodes * args.training_num_gpus_per_node
     )
     n_engines = len(inference_engines)
-    if n_engines != dp_size:
+    if n_engines == 0 or dp_size % n_engines != 0:
         raise RuntimeError(
-            f"Colocate loop expects 1:1 engine↔trainer pairing; got "
-            f"{n_engines} engines and dp_size={dp_size}. Check that "
-            f"colocate_strategy=mps and inference_num_gpus_per_engine == 1."
+            f"Colocate loop: dp_size ({dp_size}) must be a positive multiple "
+            f"of the engine count ({n_engines}). Check colocate_strategy=mps "
+            f"and that inference_num_gpus / inference_num_gpus_per_engine are "
+            f"consistent with training_num_gpus."
         )
+    # engine_tp_size: each engine actor owns this many union ranks — its
+    # TP scheduler subprocesses — each paired 1:1 with a trainer rank.
+    # engine_tp_size == 1 is the original 1:1 engine<->trainer topology.
+    engine_tp_size = dp_size // n_engines
 
     per_dp_rank_batch_size = int(getattr(args, "per_dp_rank_batch_size", 1))
     if per_dp_rank_batch_size != 1:
@@ -248,9 +253,16 @@ def run_colocate_training_loop(
         #      will fire NCCL sends to trainer r once tensors are ready.
         # Steps 1 and 2 must both happen BEFORE we await on either side
         # because the NCCL P2P send/recv pair must rendezvous.
-        engine_refs: list[Any] = []
+        # (1) Per trainer: announce this step's tensor specs on each
+        #     trainer queue so its fetcher knows shapes before the recv.
         for r in range(dp_size):
             entry = prompts[r]
+            if entry.input_ids is None:
+                raise RuntimeError(
+                    f"colocate loop only supports pre-tokenised input_ids "
+                    f"prompts (defer_tokenization=False); got entry "
+                    f"data_id={entry.data_id} with no input_ids."
+                )
             seq_len = _seq_len_from_input_ids(entry.input_ids)
             specs = _build_tensor_specs(
                 seq_len,
@@ -258,28 +270,31 @@ def run_colocate_training_loop(
                 num_aux_layers=num_aux_layers,
                 store_last_hidden_states=store_last_hidden_states,
             )
-            sample = ColocateTrainSample(
-                step_id=completed_steps,
-                tensor_specs=specs,
-                packed_loss_mask=entry.packed_loss_mask,
-            )
-            train_queues[r].put(sample)
-
-            if entry.input_ids is None:
-                raise RuntimeError(
-                    f"colocate loop only supports pre-tokenised input_ids "
-                    f"prompts (defer_tokenization=False); got entry "
-                    f"data_id={entry.data_id} with no input_ids."
+            train_queues[r].put(
+                ColocateTrainSample(
+                    step_id=completed_steps,
+                    tensor_specs=specs,
+                    packed_loss_mask=entry.packed_loss_mask,
                 )
-            input_ids_ref = ray.put([entry.input_ids])
-            packed_loss_mask_list = (
-                [entry.packed_loss_mask] if entry.packed_loss_mask else None
             )
+
+        # (2) Per engine: one generate() carrying its engine_tp_size
+        #     prompts — those for trainers [e*tp, e*tp+tp). The engine's
+        #     TP scheduler subprocesses process the batch together; TP
+        #     rank t NCCL-sends batch item t to trainer e*tp+t (the
+        #     colocate.patch _send_hidden_states_to_nccl gate enforces
+        #     the per-TP-rank partition). At engine_tp_size==1 this is
+        #     the original one-prompt-per-engine dispatch.
+        engine_refs: list[Any] = []
+        for e in range(n_engines):
+            grp = prompts[e * engine_tp_size:(e + 1) * engine_tp_size]
+            input_ids_ref = ray.put([p.input_ids for p in grp])
+            masks = [p.packed_loss_mask for p in grp]
             engine_refs.append(
-                inference_engines[r].generate.remote(
-                    data_id=entry.data_id,
+                inference_engines[e].generate.remote(
+                    data_id=[p.data_id for p in grp],
                     input_ids_ref=input_ids_ref,
-                    packed_loss_mask_list=packed_loss_mask_list,
+                    packed_loss_mask_list=masks if any(masks) else None,
                     formatted_prompts=None,
                     return_last_hidden_states=return_last_hidden_states,
                     return_logits=return_logits,

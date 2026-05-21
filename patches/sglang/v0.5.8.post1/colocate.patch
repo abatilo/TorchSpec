@@ -498,8 +498,15 @@ index 000000000..aba6359c1
 +    )
 +
 +
-+def build_hidden_states_writer():
++def build_hidden_states_writer(tp_rank: int = 0):
 +    """Return a TorchSpec NcclHiddenStatesConnector for the spec_training callback.
++
++    ``tp_rank`` is this engine TP scheduler subprocess' rank within its
++    engine. Engine TP rank ``t`` pairs 1:1 with trainer global rank
++    ``paired_trainer_rank + t`` (the engine's base trainer rank plus the
++    TP offset); the connector's ``dst`` is that trainer. At
++    ``engine_tp_size == 1`` there is one TP rank (``tp_rank == 0``) and
++    ``dst`` is just ``paired_trainer_rank`` — the original behaviour.
 +
 +    Imported lazily so disaggregated runs (where colocate is off)
 +    never pull torchspec into sglang's import graph. Raises
@@ -531,8 +538,16 @@ index 000000000..aba6359c1
 +            "init_torch_distributed must call set_union_meta_group "
 +            "before the scheduler builds the writer."
 +        )
++    dst = env.paired_trainer_rank + int(tp_rank)
++    if not 0 <= dst < env.n_per_role:
++        raise ValueError(
++            f"build_hidden_states_writer: destination trainer rank {dst} "
++            f"out of range [0, {env.n_per_role}) (paired_trainer_rank="
++            f"{env.paired_trainer_rank}, tp_rank={tp_rank}, "
++            f"engine_tp_size={env.engine_tp_size})."
++        )
 +    return NcclHiddenStatesConnector(
-+        dst_global_rank=env.paired_trainer_rank,
++        dst_global_rank=dst,
 +        group=meta_group,
 +    )
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
@@ -584,7 +599,7 @@ index f8c65272c..c234e1816 100644
 +                build_hidden_states_writer,
 +            )
 +
-+            self.eagle_nccl_writer = build_hidden_states_writer()
++            self.eagle_nccl_writer = build_hidden_states_writer(self.tp_rank)
 +            logger.info(
 +                "[torchspec-colocate] NCCL hidden-states writer initialised "
 +                "on tp_rank=%d (paired_trainer_rank=%d).",
@@ -664,7 +679,27 @@ index 2f114c70e..ff1da02c0 100644
 +        Tensors must be contiguous and on CUDA. The connector raises
 +        ``ValueError`` if not (defensive — by this point the model
 +        runner has already produced contiguous CUDA tensors).
++
++        Multi-engine TP: every TP scheduler rank runs this callback for
++        every request (TP replicates the batch). TP rank ``t`` owns
++        batch item ``t`` — it alone sends it, and its connector's
++        ``dst`` is the matching trainer ``paired_trainer_rank + t``. At
++        ``engine_tp_size == 1`` the modulo is always ``0 == tp_rank`` so
++        every request is sent (the original 1:1 behaviour, unchanged).
 +        """
++        from sglang.srt.distributed.torchspec_colocate import read_colocate_env
++
++        _env = read_colocate_env()
++        _engine_tp = _env.engine_tp_size if _env is not None else 1
++        if _engine_tp > 1:
++            try:
++                _batch_idx = next(
++                    i for i, r in enumerate(batch.reqs) if r is req
++                )
++            except StopIteration:
++                _batch_idx = 0
++            if _batch_idx % _engine_tp != self.tp_rank:
++                return  # this batch item belongs to a different TP rank
 +        seq_len = hidden_states.shape[0]
 +        input_ids = torch.tensor(
 +            req.origin_input_ids, dtype=torch.long, device=hidden_states.device

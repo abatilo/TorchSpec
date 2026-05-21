@@ -168,13 +168,20 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 export_transfer_mode_env,
             )
 
-            # The paired trainer global rank is `self.rank` in the union
-            # world (engines occupy ranks [N, 2N), trainers [0, N), so
-            # the engine at engine-role-rank `r` is paired with trainer
-            # global rank `r` directly).
+            # PAIRED_TRAINER_RANK is the *base* trainer rank this engine
+            # actor's TP group pairs with. Engine actor `r` owns
+            # engine_tp_size union ranks; its TP rank `t` pairs 1:1 with
+            # trainer rank `base + t` where base = r * engine_tp_size.
+            # At engine_tp_size==1 this is just `self.rank` — the
+            # original 1:1 engine<->trainer pairing. The colocate.patch
+            # adds tp_rank to this base per TP scheduler subprocess.
+            engine_tp_size = int(
+                getattr(self.args, "inference_num_gpus_per_engine", 1) or 1
+            )
+            paired_trainer_base = self.rank * engine_tp_size
             export_transfer_mode_env(
                 transfer_mode="nccl",
-                paired_trainer_rank=self.rank,
+                paired_trainer_rank=paired_trainer_base,
             )
             # Also export the union-world rendezvous params we expect
             # the patch to read. We forward whatever the trainer side
@@ -196,7 +203,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 )
             logger.info(
                 f"SglEngine rank {self.rank}: transfer_mode=nccl, "
-                f"paired_trainer_rank={self.rank}. The upstream sglang "
+                f"paired_trainer_rank(base)={paired_trainer_base} "
+                f"(engine_tp_size={engine_tp_size}). The upstream sglang "
                 "patch must call init_union_world inside the TP "
                 "scheduler subprocess for the engine→trainer P2P send "
                 "to work."
