@@ -1874,6 +1874,10 @@ needs no Mooncake, and runs anywhere the colocate path runs. The
 `disagg_qwen0p6b_tiny.yaml` config was removed (it existed only for the
 old disagg arm).
 
+**GPU-validated 2026-05-20 (RunPod 2×H100):** `test_phase7_grad_parity_full`
+**PASSED** — "13 gradients match across gloo + CUDA IPC transports".
+The test no longer skips on rental hosts.
+
 ### Multi-engine TP — data plane complete
 
 The rank math (`engine_global_rank` / `build_engine_tp_ranks` /
@@ -1893,9 +1897,23 @@ states correctly:
 
 Every path is a no-op at `engine_tp_size == 1` (the validated
 topology). The patch applies clean and the tp=2 rank math is verified
-against the patched module. **A live `engine_tp_size=2` GPU run is the
-remaining validation** — the batch-index → TP-rank assumption
-(`batch.reqs` order == dispatch order) is the piece to confirm.
+against the patched module.
+
+**GPU-validated 2026-05-20 (RunPod 2×H100):**
+`tests/colocate/test_colocate_tp2.py::test_colocate_engine_tp2_end_to_end`
+**PASSED** — "1 passed in 93.89s", "[colocate-tp2] OK: 5 steps, loss
+12.037 -> 11.369". The batch-index → TP-rank routing assumption holds
+and the `engine_tp_size=2` data plane converges.
+
+The first tp=2 run failed in `initialize_model_parallel` with "TorchSpec
+colocate requires moe_ep_size == moe_tp_size == tensor_model_parallel_size":
+the original guard only passed when `tp_size==1` (sglang's default
+`expert_model_parallel_size=1` made `moe_ep_size=1 ≠ tp` for tp>1). Fixed
+in commit `6e74ffc` — the guard now rejects only real expert parallelism
+(`moe_ep_size != 1`), and a colocate branch builds `_MOE_EP` as a
+per-rank singleton from `tp_world_ranks` (`_MOE_TP` already resolves to
+`_TP` via the existing `moe_tp_size == tensor_model_parallel_size`
+branch). Re-ran → PASSED.
 
 ### Tracked follow-ups (not closed)
 
@@ -1903,8 +1921,8 @@ remaining validation** — the batch-index → TP-rank assumption
   (`ensure_mps_on_all_nodes`, `configs/colocate_qwen3_8b_2node.yaml`)
   but a true 2-node run is untested, by agreed scope. Closing it needs
   a 2-node rented cluster with cross-node networking.
-* **Multi-engine TP `engine_tp_size=2` live run** — code complete;
-  needs an MPS host (RunPod/Vast — Modal's gVisor has no MPS).
+* ~~**Multi-engine TP `engine_tp_size=2` live run**~~ — ✅ **VALIDATED**
+  2026-05-20 on RunPod 2×H100 (see above).
 * **`v0.5.10.post1/colocate.patch`** — the forward-port needs the same
   `build_hidden_states_writer` / `_send_hidden_states_to_nccl`
   multi-TP changes ported from `v0.5.8.post1`.
