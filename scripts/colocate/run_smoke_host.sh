@@ -41,6 +41,10 @@
 #   PHASE6_STABILITY_STEPS=200         # default 200; bump to 1000 on 4xH100
 #   PHASE7_CONVERGE_STEPS=50           # default 50; bump to 1000 for full
 #   SGLANG_DIR=/abs/path/to/sglang     # default <repo>/_sglang
+#   SGLANG_PATCH_VERSION=v0.5.10.post1 # default v0.5.8.post1; selects
+#                                      #   which patches/sglang/<ver>/ dir
+#   SGLANG_COMMIT=<sha>                # default the v0.5.8.post1 base sha;
+#                                      #   must match SGLANG_PATCH_VERSION
 #   PYTHON=python3.11                  # default whatever python3 is on PATH
 #   PIP_INDEX_URL=...                  # default PyPI
 #   COLOCATE_PIN_TORCH=1               # pin torch==2.5.* if you hit a wheel mismatch
@@ -85,8 +89,8 @@ REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 cd "$REPO_ROOT"
 
 SGLANG_DIR="${SGLANG_DIR:-$REPO_ROOT/_sglang}"
-SGLANG_COMMIT="0f2df9370a1de1b4fb11b071d39ab3ce2287a350"
-SGLANG_PATCH_VERSION="v0.5.8.post1"
+SGLANG_COMMIT="${SGLANG_COMMIT:-0f2df9370a1de1b4fb11b071d39ab3ce2287a350}"
+SGLANG_PATCH_VERSION="${SGLANG_PATCH_VERSION:-v0.5.8.post1}"
 PATCHES_DIR="$REPO_ROOT/patches/sglang/$SGLANG_PATCH_VERSION"
 
 PYTHON="${PYTHON:-python3}"
@@ -311,6 +315,7 @@ pick_test_files() {
       "tests/colocate/test_grad_parity.py"
       "tests/colocate/test_colocate_checkpoint.py"
       "tests/colocate/test_colocate_ipc.py"
+      "tests/colocate/test_colocate_tp2.py"
       "tests/colocate/test_stability.py"
       "tests/colocate/test_convergence.py"
     )
