@@ -1851,10 +1851,63 @@ works in any container (validated: 5-step e2e run, loss decreasing).
 
 ### Still environment-gated
 
-* `test_phase7_grad_parity_full` (vs-disagg): needs a working Mooncake
-  disaggregated baseline. Skips on hosts where Mooncake's transfer
-  engine crashes — the colocate side is independently validated by
-  `grad_parity_determinism` + `test_p2p_multi_tensor` + `test_colocate_tiny`.
 * 1000-step stability: the nightly `colocate-stability.yml` job; the
   200-step variant is green in `--full` above.
-* True 2-node colocate: code-only by agreed scope.
+
+---
+
+## Follow-up round 2 — multi-engine TP data plane + grad-parity reframe (2026-05-20)
+
+Two items from the first follow-up round were closed out further:
+
+### grad_parity_full — reframed (no longer skips)
+
+`test_phase7_grad_parity_full` was a colocate-vs-Mooncake-disagg
+comparison that skipped on every rental host (the disagg baseline arm
+SIGSEGVs in Mooncake's Go runtime — third-party fragility, not a
+colocate bug). It is **reframed** as a gloo-vs-CUDA-IPC transport
+parity test: run the colocate tiny config twice at the same seed, once
+over each hidden-state transport, and assert per-parameter draft-model
+gradients match. Both arms are dp_size=1 and identical except the
+transport, so it isolates exactly the variable colocate introduces,
+needs no Mooncake, and runs anywhere the colocate path runs. The
+`disagg_qwen0p6b_tiny.yaml` config was removed (it existed only for the
+old disagg arm).
+
+### Multi-engine TP — data plane complete
+
+The rank math (`engine_global_rank` / `build_engine_tp_ranks` /
+`ColocateEnv.engine_tp_size`) generalised in the first round; this
+round wires the **data plane** so `engine_tp_size > 1` routes hidden
+states correctly:
+
+* `colocate_loop.py` — dispatch is per-engine (one `generate()` of
+  `engine_tp_size` prompts) rather than per-trainer; `engine_tp_size =
+  dp_size // n_engines`.
+* `sgl_engine.py` — exports `PAIRED_TRAINER_RANK` as the engine's base
+  trainer rank (`engine_index * engine_tp_size`).
+* `colocate.patch` — `build_hidden_states_writer(tp_rank)` gives each
+  TP rank a connector with `dst = paired_trainer_rank + tp_rank`;
+  `_send_hidden_states_to_nccl` gates on the request's batch index so
+  TP rank `t` sends only batch item `t`.
+
+Every path is a no-op at `engine_tp_size == 1` (the validated
+topology). The patch applies clean and the tp=2 rank math is verified
+against the patched module. **A live `engine_tp_size=2` GPU run is the
+remaining validation** — the batch-index → TP-rank assumption
+(`batch.reqs` order == dispatch order) is the piece to confirm.
+
+### Tracked follow-ups (not closed)
+
+* **Multi-node colocate** — the code is multi-node-correct
+  (`ensure_mps_on_all_nodes`, `configs/colocate_qwen3_8b_2node.yaml`)
+  but a true 2-node run is untested, by agreed scope. Closing it needs
+  a 2-node rented cluster with cross-node networking.
+* **Multi-engine TP `engine_tp_size=2` live run** — code complete;
+  needs an MPS host (RunPod/Vast — Modal's gVisor has no MPS).
+* **`v0.5.10.post1/colocate.patch`** — the forward-port needs the same
+  `build_hidden_states_writer` / `_send_hidden_states_to_nccl`
+  multi-TP changes ported from `v0.5.8.post1`.
+* **Mooncake-disagg grad parity** — the literal "vs disagg" comparison
+  from the design doc; needs a host where Mooncake's transfer engine
+  runs without crashing.
