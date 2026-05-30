@@ -14,8 +14,9 @@ RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
 
 # TorchSpec's dependency pulls the generic CUDA 12 Mooncake wheel. Replace it
 # with the CUDA 13 wheel that matches this image family.
-RUN pip uninstall -y mooncake-transfer-engine mooncake-transfer-engine-cuda13 || true && \
-    pip install --no-cache-dir --no-deps mooncake-transfer-engine-cuda13==0.3.11.post1
+RUN pip uninstall -y mooncake-transfer-engine || true && \
+    pip install --no-cache-dir --no-deps --force-reinstall \
+        mooncake-transfer-engine-cuda13==0.3.11.post1
 
 RUN chmod 755 /usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master || true
 RUN if [ -f /usr/local/lib/python3.12/dist-packages/mooncake/cli.py ]; then \
