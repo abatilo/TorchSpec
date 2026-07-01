@@ -1,0 +1,52 @@
+## Conversation
+User asked (in /plan, ultracode effort) to migrate TorchSpec checkpoint storage from fsspec
+(implemented on the unmerged `upstream-fsspec-checkpoint` branch) to NVIDIA multi-storage-client
+(MSC), building a "more storage agnostic" layer into torchspec. A research+design workflow ran
+(4 research agents, 14 adversarial verifiers, 2 design variants, 1 judge). Plan approved and saved
+at ~/.claude/plans/lucky-swimming-breeze.md. Implemented on worktree branch
+worktree-abatilo+msc-storage (branch name abatilo/msc-storage), based on origin/main @ e34a17f.
+
+During plan review the user pushed back on requiring a .msc_config.yaml on k8s pods and asked
+whether AWS_S3_ADDRESSING_STYLE would work for implicit-profile config. Research (botocore 1.40.61
+source) showed: that env var does NOT exist, BUT path-style addressing is automatic whenever a
+custom endpoint_url is set (botocore/utils.py:2633), so env-only Recipe A fully covers CoreWeave.
+
+## Actions
+- Verified fsspec branch diff (8 files) vs merge-base f1c59f1; confirmed main's checkpoint files
+  are byte-identical to the fsspec branch point, so the port lands cleanly.
+- Verified every MSC symbol against github.com/NVIDIA/multi-storage-client primary sources.
+- Wrote torchspec/training/storage.py (this commit) and added the `msc` pyproject extra.
+
+## Errors & Mistakes
+- Import-smoke first tried `import multistorageclient.torch` -> ModuleNotFoundError. The DCP module
+  is NOT a direct submodule; it's a lazy attribute alias (msc.torch -> multistorageclient.contrib.torch
+  via top-level __getattr__). storage.py uses attribute access (_msc().torch.X), which is correct.
+- A research agent initially claimed MSC's torch extra is `torch<3,>=2.11`; adversarial verify REFUTED
+  the version claim (repo main is now `>=2.12.1`). Resolution: pin `>=0.50.0,<1` (the 0.50.0 RELEASE's
+  torch extra is torch<3,>=2.11, accepts target torch 2.11.0); re-check resolved version at install.
+
+## Dead Ends
+- Considered an "MSC-via-fsspec shim" (keep storage.py ~identical, route through MSC's fsspec
+  protocol). Rejected: MSC's only supported DCP integration is the explicit writer/reader objects,
+  not an msc:// checkpoint_id string, so a shim can't cover the load-bearing shard I/O.
+- Considered "drop s3:// entirely, msc:// only". Rejected once research showed s3:// works through MSC
+  implicit profiles with zero config file. Kept s3:// scheme; dropped only the fsspec/s3fs backend.
+
+## Hints for Future Agents
+- storage.dcp_save/dcp_load pass storage_writer/storage_reader ONLY for remote and checkpoint_id ONLY
+  for local. Do not pass both (DCP ambiguity). The writer/reader carry the path.
+- msc.list(base, include_directories=True) returns ObjectMetadata whose .key is canonicalized to
+  msc://<profile>/... even for an s3:// base; that key feeds straight back into msc.delete.
+- msc.delete raises FileNotFoundError on a missing path -> callers must catch broadly.
+- The `msc` extra installs multi-storage-client (PyPI name has hyphens; import name is multistorageclient).
+
+## Codebase Discoveries
+- torch.distributed.checkpoint natively consumed fsspec s3:// as checkpoint_id (how the fsspec branch
+  worked); MSC does NOT, hence the writer/reader indirection.
+- botocore has no AWS_*ADDRESSING* env var; addressing_style config var maps env slot None
+  (configprovider.py:212). Custom endpoint auto-forces path-style (utils.py:2633). AWS_CA_BUNDLE and
+  AWS_REQUEST_CHECKSUM_CALCULATION ARE env-settable.
+
+## Open Questions
+- Multi-rank DCP over a real S3 endpoint not yet exercised (local single-rank file-profile round-trip
+  passed). Cluster verification (moky/CoreWeave) deferred to plan steps 5-6.
