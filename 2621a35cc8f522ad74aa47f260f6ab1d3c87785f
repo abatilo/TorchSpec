@@ -1,0 +1,40 @@
+## Conversation
+Companion hardening to 3fe1fd1, requested in the same staging session.
+
+## Actions
+Hand-edited patches/sglang/v0.5.14/sglang.patch: rewrote the
+should_process_hidden_states expression in the batch_result_processor.py
+hunk so req.return_hidden_states only applies when spec_training_data_id is
+None, plus a 6-line comment; bumped the hunk header (+261,20 -> +261,26).
+Verified end-to-end: shallow-fetched sgl-project/sglang @
+49e384ce9d304648e9959666ecb8ce8cd98d0deb (full SHA via gh api — GitHub
+refuses short-SHA fetches), git apply --check clean, applied it, and
+ast-parsed the resulting batch_result_processor.py.
+
+## Errors & Mistakes
+First verification attempt failed: git fetch of the short SHA 49e384ce9d is
+rejected ("couldn't find remote ref") — resolve to the full SHA first.
+
+## Dead Ends
+Considered fail-fast (raise) when the flag meets a spec request; chose
+silent-inert gating because it needs no new control flow in the patch and
+the flag combination is exercised by the existing integration test. Adding a
+warn-once was skipped to keep the hunk edit minimal; revisit at upstreaming.
+
+## Hints for Future Agents
+- When editing a vendored .patch by hand: modifying an existing +line is
+  count-neutral; ADDING lines requires bumping that hunk's +count in the
+  @@ header. Later hunks' +start offsets self-heal (git apply tolerates
+  offsets) but re-verify with git apply --check against the pinned base.
+- The diffstat block at the top of the patch file is cosmetic (git apply
+  ignores it); we left it stale deliberately.
+
+## Codebase Discoveries
+tests/test_sglang_engine_integration.py passes return_hidden_states=True
+WITH spec_training_data_id and asserts hidden_states is None + store keys
+present — it is the natural regression test for this invariant.
+
+## Open Questions
+Upstream may prefer the guard in request normalization (io_struct) instead
+of the scheduler; current placement chosen as the earliest enforced point
+that exists in the patch today.
