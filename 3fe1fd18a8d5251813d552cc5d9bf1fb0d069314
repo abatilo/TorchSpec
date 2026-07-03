@@ -1,0 +1,41 @@
+## Conversation
+User asked to stage the GLM-5.2 campaign's TorchSpec fix in this fork (branch
+abatilo/improve-training-throughput) for later upstreaming; discovered during
+a secretary-protocol train:infer ratio campaign in the coreweave/at repo
+(recipes/training/glm_5p2_ratio_ledger.md there holds the full evidence).
+
+## Actions
+Applied the same diff as at-repo patch
+docker/torchspec-amd64-ib/patches/torchspec/33d8f0f/0005-*.patch onto fork
+main (exactly 33d8f0f, clean tree). Verified TorchSpec tests do not assert
+the old kwargs (only the GPU integration test touches return_hidden_states,
+and it calls sglang directly, not this wrapper).
+
+## Errors & Mistakes
+None in this staging step. Historically: two full experiment waves were
+misled by a burst-window throughput metric before wall-clock step time
+exposed the real bottleneck; both AI debaters predicted plain-sglang
+slowness and were wrong (plain prefill was healthy at 50.5k tok/s).
+
+## Dead Ends
+Config-space fixes (batch size 1-32, put pool, concurrency, mem fraction,
+buffers, mooncake master rpc threads): all no-ops on wall-clock — the tolist
+path dominated everything.
+
+## Hints for Future Agents
+- The trainer reads tensors from Mooncake by meta_info keys; the response
+  body hidden states were ALWAYS dead weight on this path.
+- Bug is invisible at tp_size=1 (rank 0 owns the store); it detonates at
+  tp>1 and scales with TP degree.
+- Repro/verification harness: fbench (offline sgl.Engine bench inside the
+  training image; needs an if __name__ == '__main__' guard because sglang
+  spawns re-exec the module). a0/a3/a3b rows: plain / with-flag / without.
+
+## Codebase Discoveries
+_normalize_spec_training_params broadcasts spec_training_data_id;
+CaptureHiddenMode.FULL is forced by spec_training_info alone
+(forward_batch_info hunk of patches/sglang/v0.5.14/sglang.patch).
+
+## Open Questions
+Whether upstream wants warn-once instead of silent inert flag (see the
+companion hardening commit); PR to lightseekorg/TorchSpec deferred by user.
