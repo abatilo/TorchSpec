@@ -1,0 +1,20 @@
+## Conversation
+The parent requested rebasing the existing MSC checkpoint patch onto TorchSpec d9b7c24 for an ARM64 training-image vendor series.
+
+## Actions
+Applied the 33d8f0f MSC patch with a three-way merge, preserved d9b7c24 staged-draft loading, retained pathlib for local serving artifacts, updated the new continual-training test to mock the storage boundary, and ran focused tests and Ruff.
+
+## Errors & Mistakes
+The first focused test command named a nonexistent tests/test_checkpoint.py. The first real run found the new continual-training test still mocked checkpoint.dcp.load after the storage port; the test was rebased to storage.dcp_load and storage.exists.
+
+## Dead Ends
+Direct git apply --check failed because train_config.py and checkpoint.py moved since 33d8f0f. A three-way application plus explicit conflict resolution was required.
+
+## Hints for Future Agents
+Keep pathlib.Path and safetensors imports because d9b7c24 adds initial_draft_model_path loading. Route only resumable training checkpoints through storage. Re-run the continual-training and initial-draft tests after future rebases.
+
+## Codebase Discoveries
+TorchSpec d9b7c24 added staged training from a published draft and a new optimizer-state test after the old MSC patch base. The storage port must preserve both.
+
+## Open Questions
+The live S3/MSC checkpoint smoke still requires the ARM64 image and GB300 runtime.
