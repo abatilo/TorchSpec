@@ -1,0 +1,20 @@
+## Conversation
+The user asked for a minimal DFlash2 implementation with tests and a draft pull request. The export follow-up reviewer reproduced a full-shard save fallback that wrote local DTensors and logged a complete serving checkpoint.
+
+## Actions
+Changed Trainer.save_draft_model_for_serving to propagate a full-state gather failure when fsdp_strategy is FULL_SHARD. Preserved the local model.state_dict fallback for replicated and unsharded strategies. Ran Ruff, formatting, the 18 focused tests, diff checks, and a mocked FULL_SHARD gather-failure smoke that confirmed the original RuntimeError propagates.
+
+## Errors & Mistakes
+None.
+
+## Dead Ends
+Saving model.state_dict after a FULL_SHARD gather failure was rejected because it contains local DTensor shards even though torch.save succeeds. There is no safe rank-local reconstruction fallback.
+
+## Hints for Future Agents
+Do not catch a FULL_SHARD full-state gather error and then write model.state_dict. A successful torch.save call does not prove that tensors are full or loadable by a serving model. Replicated models can still use the local-state fallback.
+
+## Codebase Discoveries
+The generic serving-save fallback affects scratch draft creation and disk weight synchronization for every trainer. The reviewer reproduced 22 DTensor values in a two-rank DFlash2 save, including an fc.weight with global shape 16 by 32 and local shape 8 by 32.
+
+## Open Questions
+The save path does not coordinate rank-local filesystem write failures across the distributed group. A future change could propagate rank-zero artifact failures before the final barrier.
