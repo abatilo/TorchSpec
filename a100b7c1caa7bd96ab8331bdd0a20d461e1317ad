@@ -1,0 +1,20 @@
+## Conversation
+The parent requested carrying the still-applicable Mooncake training patch into the d9b7c24 ARM64 series.
+
+## Actions
+Applied the historical rpc_thread_num patch unchanged in behavior, added focused assertions for command-line and launch propagation, and ran the non-integration Mooncake master tests plus Ruff.
+
+## Errors & Mistakes
+The full Mooncake master test file fails its real-subprocess case on macOS because the Linux-specific preexec_fn fails. The same exact test fails on unpatched d9b7c24, so it is not a regression from this patch.
+
+## Dead Ends
+Running test_mooncake_force_delete was not useful in the local venv because mooncake is not installed. The focused master tests provide the relevant CPU proof.
+
+## Hints for Future Agents
+Treat rpc_thread_num as a diagnostic knob. Zero preserves the binary default. Re-run the real subprocess and binary flag smoke inside the Linux ARM64 image.
+
+## Codebase Discoveries
+The old source hunk still applied cleanly to d9b7c24. Existing tests did not assert the knob reached either the binary command or Ray actor call, so coverage was added.
+
+## Open Questions
+The knob has historical diagnostic value but did not improve the prior H3 contention experiment. Its live GB300 behavior remains untested.
