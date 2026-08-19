@@ -22,6 +22,7 @@ import abc
 import concurrent.futures
 import dataclasses
 import itertools
+import json
 import logging
 import os
 import time
@@ -44,7 +45,7 @@ from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataF
 from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
+from torchspec.utils.distributed import get_gloo_group, get_usp_device_mesh, get_usp_grad_sync_mesh
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -506,6 +507,30 @@ class Trainer(abc.ABC):
             return
         checkpoint.save(self, step=step)
 
+    def _write_serving_artifacts(self, model, state_dict: dict, output_dir: str) -> None:
+        if hasattr(model, "config"):
+            config = (
+                model.config_for_serving() if hasattr(model, "config_for_serving") else model.config
+            )
+            if isinstance(config, dict):
+                with open(os.path.join(output_dir, "config.json"), "w") as config_file:
+                    json.dump(config, config_file, indent=2)
+            else:
+                config.save_pretrained(output_dir)
+        if hasattr(model, "state_dict_for_serving"):
+            state_dict = model.state_dict_for_serving(state_dict)
+        torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+
+    def _synchronize_serving_error(self, error: Exception | None) -> str | None:
+        if not dist.is_initialized():
+            return None if error is None else f"{type(error).__name__}: {error}"
+
+        group = get_gloo_group()
+        errors = [None] * dist.get_world_size(group)
+        local_error = None if error is None else f"{type(error).__name__}: {error}"
+        dist.all_gather_object(errors, local_error, group=group)
+        return next((message for message in errors if message is not None), None)
+
     def save_draft_model_for_serving(self, output_dir: str) -> None:
         """Save draft model in HuggingFace format for serving update."""
         os.makedirs(output_dir, exist_ok=True)
@@ -513,7 +538,11 @@ class Trainer(abc.ABC):
         model = self.draft_model
         if hasattr(model, "module"):
             model = model.module
+        custom_schema = hasattr(model, "config_for_serving") or hasattr(
+            model, "state_dict_for_serving"
+        )
 
+        save_error = None
         try:
             state_dict = get_model_state_dict(
                 self.draft_model,
@@ -522,9 +551,12 @@ class Trainer(abc.ABC):
 
             if self.dp_rank == 0:
                 if hasattr(model, "save_pretrained"):
-                    if hasattr(model, "config"):
-                        model.config.save_pretrained(output_dir)
-                    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+                    if custom_schema:
+                        self._write_serving_artifacts(model, state_dict, output_dir)
+                    else:
+                        if hasattr(model, "config"):
+                            model.config.save_pretrained(output_dir)
+                        torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
                     logger.info(f"[Rank {self.dp_rank}] Saved draft model to {output_dir}")
                 else:
                     torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
@@ -532,9 +564,50 @@ class Trainer(abc.ABC):
                         f"[Rank {self.dp_rank}] Saved draft model state dict to {output_dir}"
                     )
 
-        except Exception as e:
+        except Exception as error:
+            save_error = error
+
+        if custom_schema:
+            synchronized_error = self._synchronize_serving_error(save_error)
+            if synchronized_error is None:
+                return
+
+            strategy = getattr(getattr(self, "args", None), "fsdp_strategy", "REPLICATE")
+            if strategy.upper() == "FULL_SHARD":
+                if save_error is not None:
+                    raise save_error
+                raise RuntimeError(
+                    f"Failed to save a full serving state dict on another rank: "
+                    f"{synchronized_error}"
+                )
+
             logger.warning(
-                f"[Rank {self.dp_rank}] Failed to save with FSDP2 state dict, trying fallback: {e}"
+                f"[Rank {self.dp_rank}] Failed to save with FSDP2 state dict, trying fallback: "
+                f"{synchronized_error}"
+            )
+            fallback_error = None
+            try:
+                if self.dp_rank == 0:
+                    self._write_serving_artifacts(model, model.state_dict(), output_dir)
+                    logger.info(
+                        f"[Rank {self.dp_rank}] Saved draft model using save_pretrained to {output_dir}"
+                    )
+            except Exception as error:
+                fallback_error = error
+
+            synchronized_error = self._synchronize_serving_error(fallback_error)
+            if synchronized_error is not None:
+                if fallback_error is not None:
+                    raise fallback_error
+                raise RuntimeError(
+                    f"Failed to save serving artifacts on another rank: {synchronized_error}"
+                )
+            return
+
+        if save_error is not None:
+            logger.warning(
+                f"[Rank {self.dp_rank}] Failed to save with FSDP2 state dict, trying fallback: "
+                f"{save_error}"
             )
             if self.dp_rank == 0:
                 if hasattr(model, "save_pretrained"):

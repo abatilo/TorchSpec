@@ -229,6 +229,8 @@ python tools/convert_to_hf.py --input-dir ./outputs/my_experiment/iter_0010000/
 
 Vocabulary pruning, which reduces the draft model `lm_head` to a smaller token set and emits `d2t` and `t2d` mappings, can be applied either during training or at conversion time.
 
+DFlash2 requires the full target vocabulary. Do not set `draft_vocab_size` or pass `--prune-vocab` for a DFlash2 model.
+
 - **Pre-pruning**: set `draft_vocab_size` in your training config. The checkpoint already contains the pruned `lm_head` and `d2t`/`t2d` buffers, so the basic conversion command is enough.
 - **Post-pruning**: train with the full vocabulary, then pass `--prune-vocab` at conversion time together with a representative dataset to compute token frequencies.
 

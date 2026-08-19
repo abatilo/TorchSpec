@@ -20,9 +20,21 @@
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from torchspec.training.lr_scheduler import LRSchedulerWithWarmup
 from torchspec.utils.logging import print_on_rank0
+
+
+def _copy_tensors_(destinations, sources):
+    has_dtensor = any(isinstance(tensor, DTensor) for tensor in destinations) or any(
+        isinstance(tensor, DTensor) for tensor in sources
+    )
+    if has_dtensor:
+        for destination, source in zip(destinations, sources, strict=True):
+            destination.copy_(source)
+        return
+    torch._foreach_copy_(destinations, sources)
 
 
 class BF16Optimizer:
@@ -87,7 +99,7 @@ class BF16Optimizer:
                 else:
                     mp.grad = None
             if grad_destinations:
-                torch._foreach_copy_(grad_destinations, grad_sources)
+                _copy_tensors_(grad_destinations, grad_sources)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
 
@@ -98,14 +110,17 @@ class BF16Optimizer:
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             # A sharded rank may be the only one that observes a nonfinite
             # gradient. All training ranks must make the same update decision.
-            dist.all_reduce(found_inf, op=dist.ReduceOp.MAX)
+            collective_found_inf = (
+                found_inf.to_local() if isinstance(found_inf, DTensor) else found_inf
+            )
+            dist.all_reduce(collective_found_inf, op=dist.ReduceOp.MAX)
         self.optimizer.found_inf = found_inf
         self.optimizer.step()
 
         self.optimizer.zero_grad()
         self.scheduler.step()
         with torch.no_grad():
-            torch._foreach_copy_(self.model_params, self.fp32_params)
+            _copy_tensors_(self.model_params, self.fp32_params)
             for p in self.model_params:
                 p.grad = None
 
@@ -126,7 +141,7 @@ class BF16Optimizer:
     def sync_fp32_params_from_model(self):
         """Reinitialize fp32_params from model params. Call after loading model checkpoint."""
         with torch.no_grad():
-            torch._foreach_copy_(self.fp32_params, self.model_params)
+            _copy_tensors_(self.fp32_params, self.model_params)
 
     def state_dict(self):
         return self.optimizer.state_dict()

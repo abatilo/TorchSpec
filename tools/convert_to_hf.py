@@ -58,6 +58,7 @@ from tqdm import tqdm
 from typing_extensions import override
 
 from torchspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
+from torchspec.models.draft.dflash2 import dflash2_config_for_serving
 from torchspec.models.draft.keymap import DRAFT_WEIGHT_KEY_REMAP
 
 logging.basicConfig(
@@ -143,6 +144,7 @@ def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tens
 
 
 _MODEL_TYPE_REMAP = {
+    "qwen3_dflash2": "qwen3",
     "qwen3_dspark": "qwen3",
 }
 
@@ -159,6 +161,9 @@ def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dic
         eagle_cfg = config.get("eagle_config")
         if eagle_cfg and key in eagle_cfg:
             eagle_cfg[key] = [x + 1 for x in eagle_cfg[key]]
+
+    if config.get("architectures") == ["DFlash2DraftModel"]:
+        config = dflash2_config_for_serving(config, export_for_vllm=export_for_vllm)
 
     if config["model_type"] in _MODEL_TYPE_REMAP:
         config["model_type"] = _MODEL_TYPE_REMAP[config["model_type"]]
@@ -256,6 +261,9 @@ def _extract_model_weights(
 
 def _prepare_export_tensors(hf_model) -> dict[str, torch.Tensor]:
     tensors = hf_model.state_dict()
+    if hasattr(hf_model, "state_dict_for_serving"):
+        logger.info("Exporting serving checkpoint keys")
+        return hf_model.state_dict_for_serving(tensors)
     logger.info("Exporting native checkpoint keys")
     return _remap_weight_keys(tensors)
 
@@ -264,6 +272,7 @@ def _save_without_vocab_pruning(
     hf_model, output_dir: str, raw_config: dict, vocab_size: int, export_for_vllm: bool = False
 ) -> None:
     version = _get_torchspec_version()
+    export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
     tensors = _prepare_export_tensors(hf_model)
     save_file(
         tensors,
@@ -271,7 +280,6 @@ def _save_without_vocab_pruning(
         metadata={"torchspec_version": version},
     )
 
-    export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
     export_config["draft_vocab_size"] = vocab_size
     export_config["_torchspec_version"] = version
     actual_dtype = next(iter(tensors.values())).dtype
@@ -473,6 +481,13 @@ def _convert_fsdp_to_hf(
     max_seq_length: int = 32768,
     cache_dir: Optional[str] = None,
 ) -> None:
+    config = AutoDraftModelConfig.from_file(config_path)
+    if prune_vocab and config.model_type == "qwen3_dflash2":
+        raise ValueError(
+            "DFlash2 vocabulary pruning is not supported because selector codebooks "
+            "use target-vocabulary token IDs."
+        )
+
     logger.info("Loading FSDP model from %s", input_dir)
     t = time.time()
     state_dict = _load_fsdp_state_dict(input_dir)
@@ -485,7 +500,6 @@ def _convert_fsdp_to_hf(
             "Please pass the checkpoint directory (e.g. iter_xxx or iter_xxx/model)."
         )
 
-    config = AutoDraftModelConfig.from_file(config_path)
     hf_model = AutoEagle3DraftModel.from_config(config)
 
     ckpt_dtype = Counter(v.dtype for v in model_state.values()).most_common(1)[0][0]
@@ -493,11 +507,21 @@ def _convert_fsdp_to_hf(
     logger.info("Checkpoint dtype: %s, output dtype: %s", ckpt_dtype, final_dtype)
     hf_model = hf_model.to(ckpt_dtype)
 
-    missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
-    if missing:
-        logger.warning("Missing keys: %s", missing)
-    if unexpected:
-        logger.warning("Unexpected keys: %s", unexpected)
+    if config.model_type == "qwen3_dflash2":
+        missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
+        allowed_missing = {"embed_tokens.weight"} if target_model_path else set()
+        invalid_missing = sorted(set(missing) - allowed_missing)
+        if invalid_missing or unexpected:
+            raise RuntimeError(
+                "DFlash2 checkpoint state does not match the configured model: "
+                f"missing={invalid_missing}, unexpected={sorted(unexpected)}"
+            )
+    else:
+        missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
+        if missing:
+            logger.warning("Missing keys: %s", missing)
+        if unexpected:
+            logger.warning("Unexpected keys: %s", unexpected)
 
     # Optionally override embed_tokens from target model.
     # Useful for older checkpoints where embed_tokens may not have been saved correctly.
