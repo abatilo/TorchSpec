@@ -1,66 +1,64 @@
 ## Conversation
-The user asked to own and finish lightseekorg/TorchSpec PR #176 from the existing isolated worktree. The required acceptance gate was functional DFlash2 serving behavior, not artifact loading. The user required exact Qwen3-8B YAML training evidence, a clear boundary between the public inference selector and TorchSpec's inferred training objective, minimal code, current-main rebase, a clean final history, pushed git notes, exact PR evidence, and exact-head CI verification.
+The user asked to own and finish lightseekorg/TorchSpec PR #176 from the existing isolated worktree. The acceptance gate was functional DFlash2 serving behavior, not artifact loading. Requirements included exact Qwen3-8B YAML training evidence, a clear boundary between public inference and TorchSpec's inferred objective, minimal code, current-main rebase, one clean commit, pushed notes, exact PR evidence, and exact-head CI.
 
 ## Actions
-Inspected branch abatilo/dflash2-ready at 2a756ab320053595fe6dfe738b3df0536a9e97ad, its nine follow-up commits, the uncommitted tests/test_dflash2.py follow-up, every existing commit note, the public draft PR, and live Kubernetes Jobs on context cw598e-use15 before creating new work.
+Inspected branch abatilo/dflash2-ready at 2a756ab320053595fe6dfe738b3df0536a9e97ad, its nine follow-up commits, the uncommitted test follow-up, every existing note, PR #176, and all relevant live Jobs on Kubernetes context cw598e-use15.
 
-Compared TorchSpec with the DFlash2 blog, z-lab/dflash at 07ebd93db9f472af339b644bb70221ad8428328a, merged SGLang DFlash2 commit c14312a66420b75ca9a11bf1817c4db1fa26b097, and open vLLM PR head 19c9351904df4c63042671bc67a866ca48dc7d6f. Confirmed that the public serving selector uses target top-K candidates, transformed unary logits, predecessor/successor codebooks, and adjacent path scores. Confirmed that TorchSpec's teacher-forced selector cross-entropy is an inferred training objective; no public source establishes private recipe parity.
+Compared TorchSpec with the DFlash2 blog, z-lab/dflash at 07ebd93db9f472af339b644bb70221ad8428328a, merged SGLang commit c14312a66420b75ca9a11bf1817c4db1fa26b097, and open vLLM PR head 19c9351904df4c63042671bc67a866ca48dc7d6f. Public sources specify target top-K candidates, transformed unary logits, predecessor/successor codebooks, and adjacent path scores. TorchSpec's gold-inserting, teacher-forced cross-entropy is an inferred objective; no private-recipe parity is claimed.
 
-Retained the completed exact Qwen3-8B evidence: ts-q3-df-2a756ab-fs-a2 completed a FULL_SHARD step; ts-q3-df2-2a756ab-3ep-a2 completed the exact DFlash2 YAML for 375 updates and three epochs; ts-q3-df2-2a756ab-final-a1 strictly exported iter_0000376; and the SGLang c14312a jobs loaded and exercised that export. The exact training image was cw598e-dev-use14a.cwcr.io/torchspec-amd64-ib@sha256:7dd8ad819a3fc0eea2b961dfac2c910b42680015076ecf7a44c005dadd332562. Its receipt records TorchSpec revision 2a756ab320053595fe6dfe738b3df0536a9e97ad and materialized tree 055f5f65d85de94ac41454f297f03f3605a1dbd6.
+Retained the exact Qwen3-8B campaign: ts-q3-df-2a756ab-fs-a2 completed FULL_SHARD; ts-q3-df2-2a756ab-3ep-a2 completed the exact DFlash2 YAML for three epochs and 375 updates; ts-q3-df2-2a756ab-final-a1 strictly exported iter_0000376; and SGLang c14312a Jobs loaded and exercised the export. The immutable TorchSpec image is cw598e-dev-use14a.cwcr.io/torchspec-amd64-ib@sha256:7dd8ad819a3fc0eea2b961dfac2c910b42680015076ecf7a44c005dadd332562. Its receipt records revision 2a756ab320053595fe6dfe738b3df0536a9e97ad and materialized tree 055f5f65d85de94ac41454f297f03f3605a1dbd6.
 
-Used the existing target-generated Qwen3-8B dataset from ts-qwen3-8b-target-data-c14312a-a8 at s3://model-opt-use15-dev/datasets/torchspec/qwen3-8b/sample-conversations-target-greedy-64/2a756ab-c14312a-20260819-a8/train.jsonl. Ran diagnostic ts-q3-df2-target64-match375-a3 with the same architecture and 375 updates, but with 64 target-generated rows repeated for 47 passes. This was an override-based diagnostic, not exact-YAML validation. It completed with step-375 loss 0.162572 and saved FULL_SHARD iter_0000376.
+Used target-generated Qwen3-8B data from ts-qwen3-8b-target-data-c14312a-a8. Diagnostic ts-q3-df2-target64-match375-a3 trained 64 rows for the same 375 updates, or 47 passes. This override-based run is not exact-YAML validation. It completed with step-375 loss 0.162572 and saved FULL_SHARD iter_0000376. Strict export ts-q3-df2-target64-final-a1 validated step 375, world size 4, four shards per component, 81 exact serving keys, no embedding or LM-head weights, and the public serving config.
 
-Ran strict export Job ts-q3-df2-target64-final-a1. It validated step 375, world size 4, four distributed checkpoint shards per component, 81 exact public serving keys, no embeddings or LM head, the public config schema, and uploaded s3://model-opt-use15-dev/runs/conversion/torchspec-qwen3-8b-dflash2/pr176-2a756ab-target-greedy64-match375-a3-final/.
+Serving gate ts-q3-df2-target64-sglang-c14312a-a1 used immutable SGLang c14312a and Qwen3-8B target revision b968826d9c46dd6066d109eabc6255188de91218. Across three canonical 128-token training prefixes, it accepted 151 of 315 proposals. Acceptance rate was 0.4793650793650794 and acceptance length was 4.266666666666667. The prior exact artifact accepted 6 of 399 and produced 1.1228070175438596 tokens per verification. The target-data diagnostic passed its predeclared 0.15 rate and 2.0 length gates. Evidence is under s3://model-opt-use15-dev/runs/serving/torchspec-qwen3-8b-dflash2/pr176-2a756ab-target-greedy64-match375-a3-sglang-c14312a-a1/.
 
-Ran serving gate ts-q3-df2-target64-sglang-c14312a-a1 with the immutable SGLang c14312a image, Qwen3-8B target revision b968826d9c46dd6066d109eabc6255188de91218, and three shortest target-generated rows. Across three canonical 128-token training prefixes, it accepted 151 of 315 proposed drafts, for a 0.4793650793650794 acceptance rate and 4.266666666666667 tokens per verification. The prior exact artifact's memorized-prefix diagnostic accepted 6 of 399 proposals and produced 1.1228070175438596 tokens per verification. The diagnostic passed its predeclared 0.15 acceptance-rate and 2.0 acceptance-length gates. Evidence is at s3://model-opt-use15-dev/runs/serving/torchspec-qwen3-8b-dflash2/pr176-2a756ab-target-greedy64-match375-a3-sglang-c14312a-a1/.
+Fetched upstream/main 5699d703e5b2e05e9ed2911ec8c88fa4f4159117 and reduced the feature to one commit. Before critic changes, tree d19b2385215cc9ca512771ca4a198eea435922a0 matched before and after the rewrite. Three read-only critics reviewed architecture, distributed export, and scope. Their justified findings led to narrow fixes: reject DFlash2 fc_norm, pruned vocabularies, non-positive output multipliers, and invalid softcaps; permit a missing embedding during strict conversion only when target_model_path supplies it; and document the full-vocabulary limit. Final tree is d662808eb6a152385186b8acb4026044c36a31f4.
 
-Mounted the retained tests/test_dflash2.py follow-up by SHA-256 98b2a904150c8d55a1d7e9bb9425aa692c7e12f537c6a6a639eabd3837017b55 into the immutable TorchSpec image. Job ts-pr176-dflash2-tests-followup-a2 passed 21 tests and 16 subtests. Ran the full pre-commit suite locally; every hook passed. Fetched current upstream/main 5699d703e5b2e05e9ed2911ec8c88fa4f4159117, staged the retained test follow-up, verified desired tree d19b2385215cc9ca512771ca4a198eea435922a0 before and after the history rewrite, and reduced the feature to this single commit.
+After critic changes, ts-pr176-dflash2-tests-followup-a4 mounted exact files by SHA-256: tests/test_dflash2.py a22385984bae01d4ed5cb65e33b4bb1ca4c44ad0067e935f14a958cd7ae1776d, torchspec/models/draft/dflash2.py f9b95168daaa5d86ef505995346a0158dd58ce0685d0e79fdd5cf07e01188a43, and tools/convert_to_hf.py 3ddf7ac9a2c70c675ba63a0dcf03fa8dc2d3a900d5e7090c879e7f8a466a8006. It passed 22 tests and 21 subtests. The full local pre-commit suite passed.
 
 ## Errors & Mistakes
-The first target-data diagnostic manifest, ts-q3-df2-target64-match375-a1, contained an invalid Python evidence mapping after a string substitution. It had not started. Its UID and ownership were checked, and only that new Job was deleted.
+The first target-data manifest, ts-q3-df2-target64-match375-a1, contained invalid Python evidence metadata after string substitution. It had not started. Its UID and ownership were checked, and only that new Job was deleted.
 
-ts-q3-df2-target64-match375-a2 failed before training because the dataset download ran before S3 virtual-host addressing was configured. The AWS HeadObject request returned 400 Bad Request. No training evidence was claimed from that Job.
+ts-q3-df2-target64-match375-a2 failed before training because dataset download preceded S3 virtual-host configuration. AWS HeadObject returned 400 Bad Request. No training evidence was claimed.
 
-The first serving-manifest construction attempt referenced the temporary verifier file in the wrong worktree and created no Job. The next preview loop used zsh's special path variable name, which replaced PATH and produced `command not found: jq` and `command not found: bash`; it also created no Job. Renaming the variable to json_path fixed the preview.
+The first serving-manifest construction referenced a verifier in the wrong worktree and created no Job. The next preview loop used zsh's special path variable, replaced PATH, and reported `command not found: jq` and `command not found: bash`; it also created no Job.
 
-The local focused-test attempt failed with `/Users/abatilo/.codex/worktrees/pr176-ready/TorchSpec/.venv/bin/python: No module named pytest`. The immutable cluster image was used instead.
+Local focused testing failed with `/Users/abatilo/.codex/worktrees/pr176-ready/TorchSpec/.venv/bin/python: No module named pytest`. The immutable cluster image was used. ts-pr176-dflash2-tests-followup-a1 then had a malformed checksum command and failed immediately with `/bin/bash: line 1: 98b2a904150c8d55a1d7e9bb9425aa692c7e12f537c6a6a639eabd3837017b55: command not found`. Corrected Jobs validated their mounted hashes and passed.
 
-ts-pr176-dflash2-tests-followup-a1 had a malformed checksum shell command and failed immediately with `/bin/bash: line 1: 98b2a904150c8d55a1d7e9bb9425aa692c7e12f537c6a6a639eabd3837017b55: command not found`. The corrected a2 Job validated the exact mounted file hash and passed.
+The first pre-commit run after critic fixes reformatted two Python files and returned nonzero. The next complete run passed.
 
-Two inherited broad CPU attempts were not green evidence. One lacked vLLM during collection. The other ran GPU and dependency-sensitive tests on an unsuitable CPU image and reported 143 failures, 765 passes, 45 skips, and one collection error. Exact-head repository CPU CI must use the repository's defined CPU-safe workflow after push.
+Two inherited broad CPU attempts were not green evidence. One lacked vLLM during collection. The other used an unsuitable CPU image for GPU and dependency-sensitive tests and reported 143 failures, 765 passes, 45 skips, and one collection error. Exact-head CPU CI must use the repository's CPU-safe workflow.
 
 ## Dead Ends
-Artifact loading and schema validation alone did not answer the acceptance question. The exact artifact loaded in SGLang but accepted only 1.50 percent of proposed drafts on a memorized training prefix.
+Artifact loading and schema validation did not answer the acceptance question. The exact artifact loaded but accepted only 1.50 percent of proposed drafts on a memorized training prefix.
 
-The original synthetic dataset's target-label top-16 coverage was 90.19 percent overall and 68.45 percent at assistant starts. This excluded a simple missing-candidate explanation but did not distinguish undertraining and data quality from a serving-contract mismatch.
+The original synthetic dataset's target-label top-16 coverage was 90.19 percent overall and 68.45 percent at assistant starts. This excluded a simple missing-candidate explanation but did not distinguish undertraining and data quality from a serving mismatch.
 
-The target-generated dataset preserves both raw SGLang completion IDs and canonical Qwen-rendered training IDs. All 64 rows differ between those representations, so raw-token equality was not used as the serving gate. The decisive test used canonical prefixes that TorchSpec actually trained on and measured SGLang speculative counters.
+All 64 target-generated rows differ between raw SGLang completion IDs and canonical Qwen-rendered training IDs. Raw-token equality was not the gate. The decisive test used canonical prefixes that TorchSpec trained on and measured SGLang speculative counters.
 
 ## Hints for Future Agents
-Do not describe the target64 diagnostic as exact-YAML validation. The exact evidence is ts-q3-df2-2a756ab-3ep-a2. The target64 run overrides the training data path, num_train_steps, and checkpoint schedule to isolate learnability and serving compatibility.
+Do not describe target64 as exact-YAML validation. Exact evidence is ts-q3-df2-2a756ab-3ep-a2. Target64 overrides only the data path, step count, and checkpoint schedule to isolate learnability and serving compatibility.
 
-Do not claim the public DFlash2 training recipe. Public sources specify the inference architecture and selector computation, but TorchSpec's gold-inserting teacher-forced selector objective is inferred.
+Do not claim the private DFlash2 training recipe. Do not use load success as a functional gate. Preserve acceptance counters, prompt receipts, target revision, source hashes, immutable images, and S3 evidence.
 
-Do not use load success as the functional gate. Preserve acceptance counters, prompt token receipts, target model revision, SGLang source hashes, immutable images, and S3 evidence.
+The overfit result rules out a structural selector, export, or SGLang mismatch. It does not establish production quality, throughput, generalization, or private-recipe parity.
 
-The strong same-data overfit result rules out a structural selector/export/SGLang mismatch. It does not establish production quality, published throughput, or private-recipe parity. The weak exact-YAML artifact is consistent with three passes over small synthetic responses that do not match target-generated behavior.
-
-The runtime image predates only the retained test rewrite. The production code in this final tree is the production code exercised at 2a756ab; the added test follow-up exercises the real FULL_SHARD conversion boundary and strict failure behavior.
+The exact recipe uses fc_norm=False, full vocabulary, output_multiplier=1.0, and no softcap. The critic fixes tighten unsupported boundaries without invalidating the campaign.
 
 ## Codebase Discoveries
-TorchSpec DFlash2 training uses the shared DFlash block objective and adds selector cross-entropy over teacher-forced adjacent transitions. When the gold successor is absent from the draft-logit top-K candidate set, training replaces the weakest candidate with gold. Serving does not insert gold.
+TorchSpec DFlash2 adds selector cross-entropy over teacher-forced adjacent transitions to shared DFlash training. When gold is absent from draft-logit top-K, training replaces the weakest candidate with gold. Serving never inserts gold.
 
-The online and offline export paths must call state_dict_for_serving and emit bare candidate-selector codebook parameter names. Strict FULL_SHARD conversion rejects missing or unexpected DFlash2 keys and rejects vocabulary pruning before loading.
+Public serving has no per-target-layer fc_norm. Selector codebooks use full target-vocabulary token IDs. Candidate top-K parity requires a finite positive output multiplier, and the softcap must be finite and positive when set.
 
-FULL_SHARD scalar reduction must use a local one-element CUDA tensor rather than a DTensor-backed scalar. Only data-parallel rank zero writes the online serving artifact, and all ranks exchange writer errors before returning.
+Strict conversion rejects all missing or unexpected DFlash2 state keys. The only exception is embed_tokens.weight when target_model_path is present, because the converter immediately replaces it. Serving exports omit embedding and LM head and emit bare selector codebook names.
 
-The exact three-epoch run contains 375 optimizer updates and saves iteration 376 because checkpoint metadata records the next iteration. Final export validates step 375 and latest_checkpointed_iteration 376.
+FULL_SHARD scalar reduction must use a local CUDA scalar, not a DTensor scalar. Only data-parallel rank zero writes the online artifact, and ranks exchange writer errors before returning.
 
-The serving gate's prompt-only results were also strong: the three selected rows produced acceptance lengths 2.909090909090909, 5.333333333333333, and 8.0. This supports the same conclusion without relying only on mid-response canonical prefixes.
+The exact run has 375 updates and saves iteration 376 because metadata records the next iteration. The serving gate's prompt-only acceptance lengths were 2.909090909090909, 5.333333333333333, and 8.0.
 
 ## Open Questions
-The private DFlash2 selector-training recipe, intended data volume, and production acceptance target are not public. This change does not answer those questions.
+The private selector recipe, intended data volume, and production acceptance target are not public.
 
-vLLM PR #52816 was open at inspection time, so vLLM runtime compatibility is source-reviewed but not claimed as live validation. SGLang PR #35371 was merged and is the runtime used here.
+vLLM PR #52816 was open during inspection, so vLLM is source-reviewed but not live-runtime validated. SGLang PR #35371 was merged and is the validated runtime.
 
-The target-generated diagnostic deliberately overfits 64 rows for 47 passes. It proves contract compatibility, not generalization. A production campaign still needs an appropriately sized target-generated dataset and an externally chosen quality or throughput target.
+The target-data diagnostic overfits 64 rows for 47 passes. It proves contract compatibility, not generalization. Production still needs an appropriately sized target-generated dataset and an externally chosen quality or throughput target.
