@@ -1,0 +1,20 @@
+## Conversation
+The parent requested carrying the proven SGLang spec-training performance patch into the d9b7c24 DFlash2 ARM64 series.
+
+## Actions
+Applied the historical prefill patch, extended the same invariant to d9b7c24's new train-with-decode prompt and tokenized paths, added decode regression coverage, and ran the focused decode tests with a local mooncake import stub plus Ruff.
+
+## Errors & Mistakes
+The local macOS venv lacks mooncake, so direct test collection failed. Injecting the minimal MooncakeDistributedStore import stub allowed the pure engine tests to run without changing source or installing image-only dependencies.
+
+## Dead Ends
+Carrying only the old sgl_engine.py hunks was insufficient because d9b7c24 added sgl_engine_decode.py with the same return_hidden_states=True payload in two branches.
+
+## Hints for Future Agents
+Spec-training requests must rely on spec_training_data_id to force CaptureHiddenMode.FULL. Do not add return_hidden_states=True: non-store TP ranks synchronously copy and serialize hidden states to the host. Check both prefill and train-with-decode paths on future rebases.
+
+## Codebase Discoveries
+The in-tree SGLang v0.5.14 patch explicitly makes batch.spec_training_info force full hidden capture. It also restricts Mooncake transfer processing to attention TP rank zero, confirming that the extra return flag is unnecessary.
+
+## Open Questions
+The historical 50x result was measured on TP8 B200 prefill. The decode extension and TP4 GB300 path still need a runtime throughput smoke.
