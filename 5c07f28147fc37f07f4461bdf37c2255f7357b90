@@ -41,7 +41,7 @@ Do not describe target64 as exact-YAML validation. Exact evidence is ts-q3-df2-2
 
 Do not claim the private DFlash2 training recipe. Do not use load success as a functional gate. Preserve acceptance counters, prompt receipts, target revision, source hashes, immutable images, and S3 evidence.
 
-The overfit result rules out a structural selector, export, or SGLang mismatch. It does not establish production quality, throughput, generalization, or private-recipe parity.
+The overfit result is evidence against a fundamental selector, export, or SGLang mismatch on the exercised path. It does not establish production quality, throughput, generalization, or private-recipe parity.
 
 The exact recipe uses fc_norm=False, full vocabulary, output_multiplier=1.0, and no softcap. The critic fixes tighten unsupported boundaries without invalidating the campaign.
 
