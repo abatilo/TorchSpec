@@ -1,0 +1,20 @@
+## Conversation
+The parent requested rebasing the existing remote checkpoint rotation patch into the TorchSpec d9b7c24 ARM64 vendor series.
+
+## Actions
+Applied the historical rotation patch after the rebased MSC layer, updated its remote deletion test to match the current leaf-enumeration contract, and ran the complete loop cleanup test file plus Ruff.
+
+## Errors & Mistakes
+The historical test expected one recursive MSC delete call, but the current storage shim deliberately enumerates leaf objects so DCP .metadata files are not skipped. The first test run exposed this stale assertion.
+
+## Dead Ends
+Keeping the historical recursive-delete assertion was rejected because it contradicted the proven hidden-file cleanup fix already present in the MSC patch.
+
+## Hints for Future Agents
+Do not replace leaf enumeration with MSC recursive delete unless MSC gains verified hidden-object deletion. Keep checkpoint rotation best-effort and scheme-agnostic.
+
+## Codebase Discoveries
+The d9b7c24 loop test file had additional fixtures, but the controller cleanup hunk itself applied cleanly after the MSC patch.
+
+## Open Questions
+Remote rotation still needs a live object-store smoke in the final ARM64 image.
