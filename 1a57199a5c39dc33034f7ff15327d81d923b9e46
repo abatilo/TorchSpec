@@ -1,0 +1,20 @@
+## Conversation
+The user asked to make PR #176 truly ready while keeping development code narrow and delaying tests and documentation until Qwen3-8B validation. A critic found that the first online-schema hook changed fallback serialization for all other draft models and could publish a local shard after a FULL_SHARD gathering failure.
+
+## Actions
+Preserved the original generic Trainer success and fallback serialization for models without serving-schema hooks. Added rank-synchronized error collection only for hook-bearing models. Made FULL_SHARD custom-schema export fail on every rank instead of falling back to a local state dict. Kept a synchronized local-state fallback for replicated hook-bearing models. Ran Ruff format check, Ruff check, and git diff --check; no tests or documentation were added or run.
+
+## Errors & Mistakes
+Commit a514c57 routed every PreTrainedModel fallback through the new raw writer. It also retried the same custom hook with model.state_dict after any FULL_SHARD failure, which could silently emit a sharded artifact and could leave peer ranks blocked if rank zero failed again.
+
+## Dead Ends
+Restoring the original PR's broad generic synchronization rewrite was rejected because it changed rank selection and error policy for every draft model. Leaving the inherited final barrier for custom-schema failures was rejected because a rank-zero-only transformation error can deadlock peers.
+
+## Hints for Future Agents
+The custom-schema path uses the Gloo group to exchange Python error strings. A successful custom-schema save returns after the all-gather, which is the required synchronization point. Models without config_for_serving or state_dict_for_serving retain the upstream behavior exactly.
+
+## Codebase Discoveries
+FULL_SHARD get_model_state_dict must succeed before a DFlash2 online serving artifact is valid. A replicated model may safely use model.state_dict as a fallback, but a sharded model must fail closed. Model-specific artifact transformation happens only on rank zero, so its errors must still be propagated to all ranks.
+
+## Open Questions
+The exact Qwen3-8B recipe does not enable online decode training, so live validation of this path requires a separate serving-artifact exercise after the requested training run. The generic inherited fallback can still block if a non-hook model fails only on rank zero; this commit deliberately does not change unrelated model behavior.
